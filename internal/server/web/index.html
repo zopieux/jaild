@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>jaild — jail manager</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #171a21;
+        --border: #282e3b;
+        --text: #e6e9ef;
+        --muted: #939ab0;
+        --accent: #5e81ac;
+        --accent-hover: #81a1c1;
+        --ok: #a3be8c;
+        --warn: #ebcb8b;
+        --danger: #bf616a;
+        --mono:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--text);
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        line-height: 1.45;
+      }
+      header {
+        max-width: 1080px;
+        margin: 0 auto 24px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1.35rem;
+        font-family: var(--mono);
+      }
+      main {
+        max-width: 1080px;
+        margin: 0 auto;
+        display: grid;
+        gap: 20px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+      input[type="text"],
+      select {
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 7px 10px;
+        font-family: var(--mono);
+        font-size: 0.88rem;
+      }
+      button {
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        border-radius: 5px;
+        padding: 7px 12px;
+        cursor: pointer;
+        font-size: 0.86rem;
+        font-weight: 500;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+      button:hover:not(:disabled) {
+        background: var(--accent-hover);
+      }
+      button:disabled {
+        opacity: 0.7;
+        cursor: wait;
+      }
+      button.danger {
+        background: var(--danger);
+      }
+      button.secondary {
+        background: #2e3440;
+      }
+      .spinner {
+        width: 13px;
+        height: 13px;
+        border: 2px solid rgba(255, 255, 255, 0.3);
+        border-top-color: #fff;
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      .pkg-progress {
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--muted);
+        margin-top: 6px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .badge {
+        font-family: var(--mono);
+        font-size: 0.76rem;
+        padding: 2px 8px;
+        border-radius: 4px;
+        background: #2e3440;
+        color: var(--muted);
+      }
+      .badge.active {
+        background: rgba(163, 190, 140, 0.18);
+        color: var(--ok);
+      }
+      .badge.ro {
+        background: rgba(235, 203, 139, 0.16);
+        color: var(--warn);
+      }
+      .badge.rw {
+        background: rgba(163, 190, 140, 0.18);
+        color: var(--ok);
+      }
+      summary.jail-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: pointer;
+        list-style: none;
+        user-select: none;
+      }
+      summary.jail-header::-webkit-details-marker {
+        display: none;
+      }
+      .jail-body {
+        margin-top: 14px;
+      }
+      .jail-title {
+        font-family: var(--mono);
+        font-size: 1.1rem;
+        font-weight: 600;
+      }
+      .section-label {
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin: 12px 0 6px;
+      }
+      .mount-list {
+        list-style: none;
+        padding: 0;
+        margin: 0 0 10px;
+        display: grid;
+        gap: 6px;
+      }
+      .mount-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: var(--bg);
+        padding: 6px 10px;
+        border-radius: 5px;
+        font-family: var(--mono);
+        font-size: 0.85rem;
+      }
+      #error-banner {
+        display: none;
+        background: rgba(191, 97, 106, 0.2);
+        border: 1px solid var(--danger);
+        color: #ffdfe2;
+        padding: 10px 14px;
+        border-radius: 6px;
+      }
+      label.chk {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 0.86rem;
+        cursor: pointer;
+        user-select: none;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>jaild</h1>
+      <button class="secondary" onclick="refresh()">Refresh</button>
+    </header>
+    <main>
+      <div id="error-banner"></div>
+
+      <section class="card">
+        <div class="section-label" style="margin-top: 0">New Jail</div>
+        <form class="row" onsubmit="createJail(event)">
+          <input
+            type="text"
+            id="new-name"
+            placeholder="jail name (e.g. dev)"
+            required
+          />
+          <input
+            type="text"
+            id="new-home-src"
+            placeholder="home_src (optional, empty = tmpfs)"
+          />
+          <select id="new-nix-mode">
+            <option value="closure">nix: closure</option>
+            <option value="full">nix: full /nix/store</option>
+          </select>
+          <label class="chk"
+            ><input type="checkbox" id="new-net" /> Network</label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="new-gpu" /> GPU (CUDA)</label
+          >
+          <label class="chk"
+            ><input type="checkbox" id="new-gui" /> X11 GUI</label
+          >
+          <button type="submit">Create Jail</button>
+        </form>
+      </section>
+
+      <div id="jails-container" style="display: grid; gap: 16px"></div>
+    </main>
+
+    <script>
+      const openJails = new Set();
+
+      function showError(msg) {
+        const errEl = document.getElementById("error-banner");
+        errEl.textContent = msg;
+        errEl.style.display = "block";
+      }
+
+      async function api(path, opts = {}) {
+        const errEl = document.getElementById("error-banner");
+        errEl.style.display = "none";
+        const res = await fetch(path, {
+          headers: { "Content-Type": "application/json" },
+          ...opts,
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          showError(txt || res.statusText);
+          throw new Error(txt);
+        }
+        if (res.status === 204 || res.status === 202) return null;
+        return res.json();
+      }
+
+      async function refresh() {
+        const jails = await api("/api/jails");
+        const root = document.getElementById("jails-container");
+        root.innerHTML = "";
+        for (const j of jails) {
+          const c = j.config;
+          const card = document.createElement("details");
+          card.className = "card";
+          card.dataset.jail = c.name;
+          if (openJails.has(c.name)) {
+            card.open = true;
+          }
+          card.addEventListener("toggle", () => {
+            if (card.open) openJails.add(c.name);
+            else openJails.delete(c.name);
+          });
+
+          const mountsHtml =
+            (c.mounts || [])
+              .map(
+                (m) => `
+      <li class="mount-item">
+        <span>${escapeHtml(m.path)} <span class="badge ${m.ro ? "ro" : "rw"}">${m.ro ? "ro" : "rw"}</span></span>
+        <button class="secondary" onclick="hidePath('${escapeJs(c.name)}', '${escapeJs(m.path)}')">Hide</button>
+      </li>
+    `,
+              )
+              .join("") ||
+            '<li style="color:var(--muted);font-size:0.85rem;">No dynamic paths exposed</li>';
+
+          const pkgsHtml =
+            (c.packages || [])
+              .map((p) => `<span class="badge">${escapeHtml(p)}</span>`)
+              .join(" ") ||
+            '<span style="color:var(--muted);font-size:0.85rem;">Base closure only</span>';
+
+          const busy = Boolean(j.adding_pkg);
+          const btnContent = busy
+            ? '<span class="spinner"></span>Adding...'
+            : "Add Package";
+
+          card.innerHTML = `
+      <summary class="jail-header">
+        <div class="row">
+          <span class="jail-title">${escapeHtml(c.name)}</span>
+          <span class="badge ${j.active ? "active" : ""}">${j.active ? "stage mounted" : "stopped"}</span>
+          <span class="badge">nix: ${escapeHtml(c.nix_mode)}</span>
+          ${j.active && c.nix_mode === "closure" ? `<span class="badge">${j.store_paths} store paths</span>` : ""}
+        </div>
+        <div class="row" onclick="event.stopPropagation()">
+          ${
+            j.active
+              ? `<button class="secondary" onclick="stopStage('${escapeJs(c.name)}')">Stop Stage</button>`
+              : `<button class="secondary" onclick="startStage('${escapeJs(c.name)}')">Mount Stage</button>`
+          }
+          <button class="danger" onclick="deleteJail('${escapeJs(c.name)}')">Delete</button>
+        </div>
+      </summary>
+
+      <div class="jail-body">
+        <div class="row" style="margin-bottom:10px;">
+          <label class="chk"><input type="checkbox" ${c.network ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'network', this.checked)"> Network</label>
+          <label class="chk"><input type="checkbox" ${c.gpu ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'gpu', this.checked)"> GPU (CUDA)</label>
+          <label class="chk"><input type="checkbox" ${c.gui ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'gui', this.checked)"> X11 GUI</label>
+          <select onchange="toggleFlag('${escapeJs(c.name)}', 'nix_mode', this.value)">
+            <option value="closure" ${c.nix_mode === "closure" ? "selected" : ""}>nix: closure</option>
+            <option value="full" ${c.nix_mode === "full" ? "selected" : ""}>nix: full</option>
+          </select>
+        </div>
+
+        <div class="section-label">Exposed Host Paths</div>
+        <ul class="mount-list">${mountsHtml}</ul>
+        <form class="row" onsubmit="exposePath(event, '${escapeJs(c.name)}')">
+          <input type="text" name="path" placeholder="/absolute/host/path" style="flex:1;" required>
+          <label class="chk"><input type="checkbox" name="rw"> allow writes</label>
+          <button type="submit">Expose</button>
+        </form>
+
+        <div class="section-label">Nix Closure Roots</div>
+        <div class="row" style="margin-bottom:8px;">${pkgsHtml}</div>
+        <form class="row" onsubmit="addPkg(event, '${escapeJs(c.name)}')">
+          <input type="text" name="pkg" placeholder="store path or flake ref (e.g. nixpkgs#ripgrep)" style="flex:1;" ${busy ? "disabled" : ""} required>
+          <button type="submit" class="pkg-btn" ${busy ? "disabled" : ""}>${btnContent}</button>
+        </form>
+        <div class="pkg-progress" style="${busy && j.pkg_progress ? "" : "display:none;"}">${escapeHtml(j.pkg_progress || "")}</div>
+      </div>
+    `;
+          root.appendChild(card);
+        }
+      }
+
+      async function createJail(e) {
+        e.preventDefault();
+        const body = {
+          name: document.getElementById("new-name").value.trim(),
+          home_src: document.getElementById("new-home-src").value.trim(),
+          nix_mode: document.getElementById("new-nix-mode").value,
+          network: document.getElementById("new-net").checked,
+          gpu: document.getElementById("new-gpu").checked,
+          gui: document.getElementById("new-gui").checked,
+        };
+        await api("/api/jails", { method: "POST", body: JSON.stringify(body) });
+        openJails.clear();
+        openJails.add(body.name);
+        e.target.reset();
+        refresh();
+      }
+
+      async function toggleFlag(name, field, val) {
+        const status = await api("/api/jails/" + encodeURIComponent(name));
+        const cfg = status.config;
+        cfg[field] = val;
+        await api("/api/jails", { method: "POST", body: JSON.stringify(cfg) });
+        refresh();
+      }
+
+      async function exposePath(e, name) {
+        e.preventDefault();
+        const path = e.target.elements.path.value.trim();
+        const ro = !e.target.elements.rw.checked;
+        await api("/api/jails/" + encodeURIComponent(name) + "/expose", {
+          method: "POST",
+          body: JSON.stringify({ path, ro }),
+        });
+        refresh();
+      }
+
+      async function hidePath(name, path) {
+        await api("/api/jails/" + encodeURIComponent(name) + "/hide", {
+          method: "POST",
+          body: JSON.stringify({ path }),
+        });
+        refresh();
+      }
+
+      async function addPkg(e, name) {
+        e.preventDefault();
+        const input = e.target.elements.pkg;
+        const btn = e.target.querySelector(".pkg-btn");
+        const pkg = input.value.trim();
+        input.disabled = true;
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span>Adding...';
+        try {
+          await api(
+            "/api/jails/" + encodeURIComponent(name) + "/packages?async=1",
+            {
+              method: "POST",
+              body: JSON.stringify({ packages: [pkg] }),
+            },
+          );
+          input.value = "";
+        } catch (_err) {
+          input.disabled = false;
+          btn.disabled = false;
+          btn.textContent = "Add Package";
+        }
+      }
+
+      async function startStage(name) {
+        await api("/api/jails/" + encodeURIComponent(name) + "/stage", {
+          method: "POST",
+        });
+        refresh();
+      }
+
+      async function stopStage(name) {
+        await api("/api/jails/" + encodeURIComponent(name) + "/stage", {
+          method: "DELETE",
+        });
+        refresh();
+      }
+
+      async function deleteJail(name) {
+        openJails.delete(name);
+        await api("/api/jails/" + encodeURIComponent(name), {
+          method: "DELETE",
+        });
+        refresh();
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+      }
+      function escapeJs(s) {
+        return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      }
+
+      function connectEvents() {
+        const es = new EventSource("/api/events");
+        es.onmessage = (evt) => {
+          try {
+            const ev = JSON.parse(evt.data);
+            if (ev.type === "pkg_progress" && ev.jail) {
+              const card = document.querySelector(
+                `details[data-jail="${CSS.escape(ev.jail)}"]`,
+              );
+              if (card) {
+                const prog = card.querySelector(".pkg-progress");
+                if (prog) {
+                  prog.textContent = ev.message || "";
+                  prog.style.display = ev.message ? "block" : "none";
+                }
+              }
+            } else if (ev.type === "pkg_done") {
+              refresh();
+            } else if (ev.type === "pkg_error") {
+              showError(ev.error || "Failed to add package");
+              refresh();
+            }
+          } catch (_e) {}
+        };
+      }
+
+      connectEvents();
+      refresh();
+    </script>
+  </body>
+</html>
