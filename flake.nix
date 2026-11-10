@@ -44,7 +44,7 @@
               in
               b != "test" && b != "module.nix" && b != "flake.nix";
           };
-          vendorHash = null;
+          vendorHash = "sha256-pbA/AlBz3cQYRTMnQ/qBPcinYOKokrBLNhkbRTq54gE=";
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
             for bin in $out/bin/jail $out/bin/jaild; do

@@ -3,6 +3,7 @@ package manager
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -31,10 +32,10 @@ func StoreRootFromPath(p string) string {
 }
 
 func ResolveInstallableOrPath(spec string) ([]string, error) {
-	return ResolveInstallableOrPathWithProgress(spec, nil)
+	return ResolveInstallableOrPathWithProgress(context.Background(), spec, nil)
 }
 
-func ResolveInstallableOrPathWithProgress(spec string, onProgress func(string)) ([]string, error) {
+func ResolveInstallableOrPathWithProgress(ctx context.Context, spec string, onProgress func(string)) ([]string, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return nil, nil
@@ -68,7 +69,7 @@ func ResolveInstallableOrPathWithProgress(spec string, onProgress func(string)) 
 	if onProgress != nil {
 		onProgress("resolving " + installable + "...")
 	}
-	cmd := exec.Command(nixBin, "--extra-experimental-features", "nix-command flakes", "build", "--no-link", "--print-out-paths", installable)
+	cmd := exec.CommandContext(ctx, nixBin, "--extra-experimental-features", "nix-command flakes", "build", "--no-link", "--print-out-paths", installable)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 
@@ -94,7 +95,7 @@ func ResolveInstallableOrPathWithProgress(spec string, onProgress func(string)) 
 	return parseLines(stdout.String()), nil
 }
 
-func QueryClosure(roots []string) ([]string, error) {
+func QueryClosure(ctx context.Context, roots []string) ([]string, error) {
 	var cleanRoots []string
 	for _, r := range roots {
 		if root := StoreRootFromPath(r); root != "" {
@@ -111,7 +112,7 @@ func QueryClosure(roots []string) ([]string, error) {
 		return cleanRoots, nil
 	}
 	args := append([]string{"-qR"}, cleanRoots...)
-	cmd := exec.Command(nixStoreBin, args...)
+	cmd := exec.CommandContext(ctx, nixStoreBin, args...)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {

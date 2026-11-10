@@ -34,7 +34,10 @@ func TestTOMLCodecRoundTrip(t *testing.T) {
 		},
 	}
 
-	encoded := EncodeTOML(orig)
+	encoded, err := EncodeTOML(orig)
+	if err != nil {
+		t.Fatalf("EncodeTOML failed: %v", err)
+	}
 	decoded, err := DecodeTOML(encoded)
 	if err != nil {
 		t.Fatalf("DecodeTOML failed: %v\nencoded:\n%s", err, encoded)

@@ -1,15 +1,17 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/BurntSushi/toml"
 
 	"jaild/internal/model"
 )
@@ -102,7 +104,10 @@ func (s *TOMLStore) writeOneLocked(cfg model.JailConfig) (model.JailConfig, erro
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return model.JailConfig{}, err
 	}
-	raw := EncodeTOML(cfg)
+	raw, err := EncodeTOML(cfg)
+	if err != nil {
+		return model.JailConfig{}, err
+	}
 	dst := s.filePath(cfg.Name)
 	tmp := dst + ".tmp"
 	if err := os.WriteFile(tmp, []byte(raw), 0o600); err != nil {
@@ -182,370 +187,22 @@ func (s *TOMLStore) AddPackages(name string, pkgs []string) (model.JailConfig, e
 	return s.writeOneLocked(cfg)
 }
 
-func EncodeTOML(cfg model.JailConfig) string {
-	var b strings.Builder
-	writeKV := func(k string, v string) {
-		fmt.Fprintf(&b, "%s = %s\n", k, strconv.Quote(v))
+func EncodeTOML(cfg model.JailConfig) (string, error) {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(cfg); err != nil {
+		return "", fmt.Errorf("encode toml: %w", err)
 	}
-	writeBool := func(k string, v bool) {
-		fmt.Fprintf(&b, "%s = %t\n", k, v)
-	}
-	writeSlice := func(k string, vs []string) {
-		if len(vs) == 0 {
-			return
-		}
-		quoted := make([]string, len(vs))
-		for i, v := range vs {
-			quoted[i] = strconv.Quote(v)
-		}
-		fmt.Fprintf(&b, "%s = [%s]\n", k, strings.Join(quoted, ", "))
-	}
-
-	writeKV("name", cfg.Name)
-	if cfg.Hostname != "" {
-		writeKV("hostname", cfg.Hostname)
-	}
-	if cfg.User != "" {
-		writeKV("user", cfg.User)
-	}
-	if cfg.Home != "" {
-		writeKV("home", cfg.Home)
-	}
-	if cfg.HomeSrc != "" {
-		writeKV("home_src", cfg.HomeSrc)
-	}
-	writeBool("network", cfg.Network)
-	writeBool("gpu", cfg.GPU)
-	writeBool("gui", cfg.GUI)
-	writeKV("nix_mode", string(cfg.NixMode))
-	writeSlice("dbus_talk", cfg.DBusTalk)
-	writeSlice("packages", cfg.Packages)
-	writeSlice("pass_env", cfg.PassEnv)
-	writeSlice("command", cfg.Command)
-
-	if len(cfg.Env) > 0 {
-		b.WriteString("\n[env]\n")
-		keys := make([]string, 0, len(cfg.Env))
-		for k := range cfg.Env {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			fmt.Fprintf(&b, "%s = %s\n", formatTOMLKey(k), strconv.Quote(cfg.Env[k]))
-		}
-	}
-
-	for _, m := range cfg.Mounts {
-		b.WriteString("\n[[mounts]]\n")
-		writeKV("path", m.Path)
-		writeKV("target", m.Target)
-		writeBool("ro", m.ReadOnly)
-	}
-
-	return b.String()
-}
-
-func formatTOMLKey(k string) string {
-	for _, r := range k {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
-			return strconv.Quote(k)
-		}
-	}
-	if k == "" {
-		return `""`
-	}
-	return k
+	return buf.String(), nil
 }
 
 func DecodeTOML(input string) (model.JailConfig, error) {
 	var cfg model.JailConfig
-	section := ""
-	var curMount *model.MountEntry
-
-	lines := strings.Split(input, "\n")
-	for lineNo, rawLine := range lines {
-		line := strings.TrimSpace(stripTOMLComment(rawLine))
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]") {
-			sec := strings.TrimSpace(line[2 : len(line)-2])
-			if sec != "mounts" {
-				return cfg, fmt.Errorf("line %d: unknown array table [[%s]]", lineNo+1, sec)
-			}
-			section = "[[mounts]]"
-			cfg.Mounts = append(cfg.Mounts, model.MountEntry{})
-			curMount = &cfg.Mounts[len(cfg.Mounts)-1]
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			sec := strings.TrimSpace(line[1 : len(line)-1])
-			if sec != "env" {
-				return cfg, fmt.Errorf("line %d: unknown table [%s]", lineNo+1, sec)
-			}
-			section = "[env]"
-			if cfg.Env == nil {
-				cfg.Env = make(map[string]string)
-			}
-			curMount = nil
-			continue
-		}
-
-		eqIdx := findTOMLEquals(line)
-		if eqIdx < 0 {
-			return cfg, fmt.Errorf("line %d: expected key = value", lineNo+1)
-		}
-		key, err := parseTOMLKey(strings.TrimSpace(line[:eqIdx]))
-		if err != nil {
-			return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-		}
-		valStr := strings.TrimSpace(line[eqIdx+1:])
-
-		switch section {
-		case "[env]":
-			v, err := parseTOMLString(valStr)
-			if err != nil {
-				return cfg, fmt.Errorf("line %d: env.%s: %w", lineNo+1, key, err)
-			}
-			cfg.Env[key] = v
-
-		case "[[mounts]]":
-			switch key {
-			case "path":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: mounts.path: %w", lineNo+1, err)
-				}
-				curMount.Path = v
-			case "target":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: mounts.target: %w", lineNo+1, err)
-				}
-				curMount.Target = v
-			case "ro":
-				v, err := strconv.ParseBool(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: mounts.ro: %w", lineNo+1, err)
-				}
-				curMount.ReadOnly = v
-			default:
-				return cfg, fmt.Errorf("line %d: unknown mounts key %q", lineNo+1, key)
-			}
-
-		default:
-			switch key {
-			case "name":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.Name = v
-			case "hostname":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.Hostname = v
-			case "user":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.User = v
-			case "home":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.Home = v
-			case "home_src":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.HomeSrc = v
-			case "nix_mode":
-				v, err := parseTOMLString(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.NixMode = model.NixMode(v)
-			case "network":
-				v, err := strconv.ParseBool(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.Network = v
-			case "gpu":
-				v, err := strconv.ParseBool(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.GPU = v
-			case "gui":
-				v, err := strconv.ParseBool(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.GUI = v
-			case "dbus_talk":
-				vs, err := parseTOMLStringArray(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.DBusTalk = vs
-			case "packages":
-				vs, err := parseTOMLStringArray(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.Packages = vs
-			case "pass_env":
-				vs, err := parseTOMLStringArray(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.PassEnv = vs
-			case "command":
-				vs, err := parseTOMLStringArray(valStr)
-				if err != nil {
-					return cfg, fmt.Errorf("line %d: %w", lineNo+1, err)
-				}
-				cfg.Command = vs
-			default:
-				return cfg, fmt.Errorf("line %d: unknown key %q", lineNo+1, key)
-			}
-		}
+	md, err := toml.Decode(input, &cfg)
+	if err != nil {
+		return cfg, err
+	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		return cfg, fmt.Errorf("unknown configuration key %q", undecoded[0].String())
 	}
 	return cfg, nil
 }
-
-func stripTOMLComment(s string) string {
-	inDouble := false
-	inSingle := false
-	escaped := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if escaped {
-			escaped = false
-			continue
-		}
-		if c == '\\' && inDouble {
-			escaped = true
-			continue
-		}
-		if c == '"' && !inSingle {
-			inDouble = !inDouble
-		} else if c == '\'' && !inDouble {
-			inSingle = !inSingle
-		} else if c == '#' && !inDouble && !inSingle {
-			return s[:i]
-		}
-	}
-	return s
-}
-
-func findTOMLEquals(s string) int {
-	inDouble := false
-	inSingle := false
-	escaped := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if escaped {
-			escaped = false
-			continue
-		}
-		if c == '\\' && inDouble {
-			escaped = true
-			continue
-		}
-		if c == '"' && !inSingle {
-			inDouble = !inDouble
-		} else if c == '\'' && !inDouble {
-			inSingle = !inSingle
-		} else if c == '=' && !inDouble && !inSingle {
-			return i
-		}
-	}
-	return -1
-}
-
-func parseTOMLKey(s string) (string, error) {
-	if strings.HasPrefix(s, `"`) || strings.HasPrefix(s, `'`) {
-		return parseTOMLString(s)
-	}
-	if s == "" {
-		return "", errors.New("empty key")
-	}
-	return s, nil
-}
-
-func parseTOMLString(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
-		return s[1 : len(s)-1], nil
-	}
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return strconv.Unquote(s)
-	}
-	return "", fmt.Errorf("invalid string literal %q", s)
-}
-
-func parseTOMLStringArray(s string) ([]string, error) {
-	s = strings.TrimSpace(s)
-	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
-		return nil, fmt.Errorf("expected array, got %q", s)
-	}
-	inner := strings.TrimSpace(s[1 : len(s)-1])
-	if inner == "" {
-		return nil, nil
-	}
-	var items []string
-	var cur strings.Builder
-	inDouble := false
-	inSingle := false
-	escaped := false
-	for i := 0; i < len(inner); i++ {
-		c := inner[i]
-		if escaped {
-			cur.WriteByte(c)
-			escaped = false
-			continue
-		}
-		if c == '\\' && inDouble {
-			cur.WriteByte(c)
-			escaped = true
-			continue
-		}
-		if c == '"' && !inSingle {
-			inDouble = !inDouble
-			cur.WriteByte(c)
-		} else if c == '\'' && !inDouble {
-			inSingle = !inSingle
-			cur.WriteByte(c)
-		} else if c == ',' && !inDouble && !inSingle {
-			token := strings.TrimSpace(cur.String())
-			if token != "" {
-				v, err := parseTOMLString(token)
-				if err != nil {
-					return nil, err
-				}
-				items = append(items, v)
-			}
-			cur.Reset()
-		} else {
-			cur.WriteByte(c)
-		}
-	}
-	token := strings.TrimSpace(cur.String())
-	if token != "" {
-		v, err := parseTOMLString(token)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, v)
-	}
-	return items, nil
-}
-

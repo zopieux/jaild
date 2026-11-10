@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -17,6 +18,8 @@ import (
 	"jaild/internal/store"
 )
 
+var ErrJailBusy = errors.New("jail is busy with an in-flight operation")
+
 type Options struct {
 	Store    store.Store
 	RootDir  string
@@ -27,8 +30,18 @@ type Options struct {
 	HostHome string
 }
 
+type stageMountState int
+
+const (
+	stageUnmounted stageMountState = iota
+	stageMountedRO
+	stageMountedRW
+)
+
 type stageState struct {
 	stageDir    string
+	mountState  stageMountState
+	rwDepth     int
 	mounted     map[string]bool
 	storeMounts map[string]bool
 	binPaths    []string
@@ -36,18 +49,45 @@ type stageState struct {
 	dbusSock    string
 }
 
+type writableStage struct {
+	*stageState
+}
+
+type jailState int
+
+const (
+	stateStopped jailState = iota
+	stateMounted
+	stateAddingPkgStopped
+	stateAddingPkgMounted
+	stateDeleting
+)
+
+func (s jailState) isMounted() bool {
+	return s == stateMounted || s == stateAddingPkgMounted
+}
+
+func (s jailState) isAddingPkg() bool {
+	return s == stateAddingPkgStopped || s == stateAddingPkgMounted
+}
+
+type jailRuntime struct {
+	state       jailState
+	stage       *stageState
+	pkgCancel   context.CancelFunc
+	pkgProgress string
+}
+
 type Manager struct {
-	mu          sync.Mutex
-	store       store.Store
-	rootDir     string
-	workDir     string
-	hostUID     int
-	hostGID     int
-	hostUser    string
-	hostHome    string
-	stages      map[string]*stageState
-	pkgBusy     map[string]int
-	pkgProgress map[string]string
+	mu       sync.Mutex
+	store    store.Store
+	rootDir  string
+	workDir  string
+	hostUID  int
+	hostGID  int
+	hostUser string
+	hostHome string
+	jails    map[string]*jailRuntime
 
 	subMu sync.Mutex
 	subs  map[chan model.Event]struct{}
@@ -64,22 +104,29 @@ func New(opts Options) (*Manager, error) {
 		opts.WorkDir = fmt.Sprintf("/run/user/%d/jail-work", opts.HostUID)
 	}
 	m := &Manager{
-		store:       opts.Store,
-		rootDir:     opts.RootDir,
-		workDir:     opts.WorkDir,
-		hostUID:     opts.HostUID,
-		hostGID:     opts.HostGID,
-		hostUser:    opts.HostUser,
-		hostHome:    opts.HostHome,
-		stages:      make(map[string]*stageState),
-		pkgBusy:     make(map[string]int),
-		pkgProgress: make(map[string]string),
-		subs:        make(map[chan model.Event]struct{}),
+		store:    opts.Store,
+		rootDir:  opts.RootDir,
+		workDir:  opts.WorkDir,
+		hostUID:  opts.HostUID,
+		hostGID:  opts.HostGID,
+		hostUser: opts.HostUser,
+		hostHome: opts.HostHome,
+		jails:    make(map[string]*jailRuntime),
+		subs:     make(map[chan model.Event]struct{}),
 	}
 	if err := m.initWorkspace(); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+func (m *Manager) runtimeLocked(name string) *jailRuntime {
+	rt, ok := m.jails[name]
+	if !ok {
+		rt = &jailRuntime{state: stateStopped}
+		m.jails[name] = rt
+	}
+	return rt
 }
 
 func (m *Manager) SubscribeEvents() (chan model.Event, func()) {
@@ -107,18 +154,19 @@ func (m *Manager) broadcast(ev model.Event) {
 }
 
 func (m *Manager) statusLocked(cfg model.JailConfig) model.JailStatus {
-	st, active := m.stages[cfg.Name]
+	rt := m.runtimeLocked(cfg.Name)
+	active := rt.state.isMounted()
 	storeCount := 0
-	if active {
-		storeCount = len(st.storeMounts)
+	if active && rt.stage != nil {
+		storeCount = len(rt.stage.storeMounts)
 	}
 	return model.JailStatus{
 		Config:      cfg,
 		Active:      active,
 		StagePath:   filepath.Join(m.rootDir, cfg.Name, "stage"),
 		StorePaths:  storeCount,
-		AddingPkg:   m.pkgBusy[cfg.Name] > 0,
-		PkgProgress: m.pkgProgress[cfg.Name],
+		AddingPkg:   rt.state.isAddingPkg(),
+		PkgProgress: rt.pkgProgress,
 	}
 }
 
@@ -168,15 +216,55 @@ func (m *Manager) GetStatus(name string) (model.JailStatus, error) {
 	return m.statusLocked(cfg), nil
 }
 
+func stageConfigEqual(a, b model.JailConfig) bool {
+	return a.User == b.User &&
+		a.Home == b.Home &&
+		a.HomeSrc == b.HomeSrc &&
+		a.Network == b.Network &&
+		a.GPU == b.GPU &&
+		a.GUI == b.GUI &&
+		a.NixMode == b.NixMode &&
+		slices.Equal(a.DBusTalk, b.DBusTalk) &&
+		slices.Equal(a.Packages, b.Packages) &&
+		slices.Equal(a.Mounts, b.Mounts)
+}
+
 func (m *Manager) CreateOrUpdateJail(cfg model.JailConfig) (model.JailStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	saved, err := m.store.Put(cfg)
-	if err != nil {
-		return model.JailStatus{}, err
+	prevCfg, prevErr := m.store.Get(cfg.Name)
+	rt := m.runtimeLocked(cfg.Name)
+
+	switch rt.state {
+	case stateStopped:
+		saved, err := m.store.Put(cfg)
+		if err != nil {
+			return model.JailStatus{}, err
+		}
+		return m.statusLocked(saved), nil
+
+	case stateMounted:
+		saved, err := m.store.Put(cfg)
+		if err != nil {
+			return model.JailStatus{}, err
+		}
+		if prevErr == nil && !stageConfigEqual(prevCfg, saved) {
+			if err := m.teardownStageLocked(saved.Name, rt); err != nil {
+				return model.JailStatus{}, err
+			}
+			if _, err := m.ensureStageLocked(saved, rt); err != nil {
+				return model.JailStatus{}, err
+			}
+		}
+		return m.statusLocked(saved), nil
+
+	case stateAddingPkgStopped, stateAddingPkgMounted, stateDeleting:
+		return model.JailStatus{}, ErrJailBusy
+
+	default:
+		return model.JailStatus{}, fmt.Errorf("unexpected jail state %d", rt.state)
 	}
-	return m.statusLocked(saved), nil
 }
 
 func (m *Manager) EnsureStage(name string) (model.JailStatus, error) {
@@ -187,22 +275,24 @@ func (m *Manager) EnsureStage(name string) (model.JailStatus, error) {
 	if err != nil {
 		return model.JailStatus{}, err
 	}
-	if _, err := m.ensureStageLocked(cfg); err != nil {
-		return model.JailStatus{}, err
-	}
-	return m.statusLocked(cfg), nil
-}
+	rt := m.runtimeLocked(name)
 
-func (m *Manager) DeleteJail(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if st, ok := m.stages[name]; ok {
-		if err := m.teardownStageLocked(name, st); err != nil {
-			return err
+	switch rt.state {
+	case stateStopped:
+		if _, err := m.ensureStageLocked(cfg, rt); err != nil {
+			return model.JailStatus{}, err
 		}
+		return m.statusLocked(cfg), nil
+
+	case stateMounted, stateAddingPkgMounted:
+		return m.statusLocked(cfg), nil
+
+	case stateAddingPkgStopped, stateDeleting:
+		return model.JailStatus{}, ErrJailBusy
+
+	default:
+		return model.JailStatus{}, fmt.Errorf("unexpected jail state %d", rt.state)
 	}
-	return m.store.Delete(name)
 }
 
 func (m *Manager) StopStage(name string) error {
@@ -212,27 +302,60 @@ func (m *Manager) StopStage(name string) error {
 	if _, err := m.store.Get(name); err != nil {
 		return err
 	}
-	if st, ok := m.stages[name]; ok {
-		return m.teardownStageLocked(name, st)
+	rt := m.runtimeLocked(name)
+
+	switch rt.state {
+	case stateStopped:
+		return nil
+
+	case stateMounted:
+		return m.teardownStageLocked(name, rt)
+
+	case stateAddingPkgStopped, stateAddingPkgMounted, stateDeleting:
+		return ErrJailBusy
+
+	default:
+		return fmt.Errorf("unexpected jail state %d", rt.state)
 	}
-	return nil
 }
 
-func (m *Manager) teardownStageLocked(name string, st *stageState) error {
-	if st.dbusProxy != nil && st.dbusProxy.Process != nil {
-		_ = st.dbusProxy.Process.Kill()
-		_ = st.dbusProxy.Wait()
+func (m *Manager) DeleteJail(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rt := m.runtimeLocked(name)
+	switch rt.state {
+	case stateDeleting:
+		return ErrJailBusy
+
+	case stateAddingPkgStopped, stateAddingPkgMounted:
+		if rt.pkgCancel != nil {
+			rt.pkgCancel()
+			rt.pkgCancel = nil
+		}
+		rt.pkgProgress = ""
+		if rt.stage != nil {
+			if err := m.teardownStageLocked(name, rt); err != nil {
+				return err
+			}
+		}
+		rt.state = stateDeleting
+
+	case stateMounted:
+		if err := m.teardownStageLocked(name, rt); err != nil {
+			return err
+		}
+		rt.state = stateDeleting
+
+	case stateStopped:
+		rt.state = stateDeleting
+
+	default:
+		return fmt.Errorf("unexpected jail state %d", rt.state)
 	}
-	if st.dbusSock != "" {
-		_ = os.Remove(st.dbusSock)
-	}
-	if err := syscall.Unmount(st.stageDir, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
-		return fmt.Errorf("unmount stage %s: %w", st.stageDir, err)
-	}
-	_ = os.Remove(st.stageDir)
-	_ = os.Remove(filepath.Join(m.rootDir, name))
-	delete(m.stages, name)
-	return nil
+
+	delete(m.jails, name)
+	return m.store.Delete(name)
 }
 
 func (m *Manager) Expose(name, rawPath, rawTarget string, ro bool) (model.JailStatus, error) {
@@ -255,20 +378,35 @@ func (m *Manager) Expose(name, rawPath, rawTarget string, ro bool) (model.JailSt
 		}
 	}
 
-	entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadOnly: ro}
-	cfg, err := m.store.SetMount(name, entry)
-	if err != nil {
-		return model.JailStatus{}, err
-	}
+	rt := m.runtimeLocked(name)
+	switch rt.state {
+	case stateStopped, stateAddingPkgStopped:
+		entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadOnly: ro}
+		cfg, err := m.store.SetMount(name, entry)
+		if err != nil {
+			return model.JailStatus{}, err
+		}
+		return m.statusLocked(cfg), nil
 
-	if st, active := m.stages[name]; active {
-		if err := m.withWritableStage(st, func() error {
-			return m.exposePathLocked(st, entry.Path, entry.Target, ro)
+	case stateMounted, stateAddingPkgMounted:
+		entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadOnly: ro}
+		cfg, err := m.store.SetMount(name, entry)
+		if err != nil {
+			return model.JailStatus{}, err
+		}
+		if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
+			return m.exposePathLocked(ws, entry.Path, entry.Target, ro)
 		}); err != nil {
 			return model.JailStatus{}, err
 		}
+		return m.statusLocked(cfg), nil
+
+	case stateDeleting:
+		return model.JailStatus{}, ErrJailBusy
+
+	default:
+		return model.JailStatus{}, fmt.Errorf("unexpected jail state %d", rt.state)
 	}
-	return m.statusLocked(cfg), nil
 }
 
 func (m *Manager) Hide(name, rawTarget string) (model.JailStatus, error) {
@@ -280,36 +418,91 @@ func (m *Manager) Hide(name, rawTarget string) (model.JailStatus, error) {
 		return model.JailStatus{}, fmt.Errorf("path must be absolute: %q", rawTarget)
 	}
 
-	cfg, err := m.store.RemoveMount(name, cleanTarget)
-	if err != nil {
-		return model.JailStatus{}, err
-	}
+	rt := m.runtimeLocked(name)
+	switch rt.state {
+	case stateStopped, stateAddingPkgStopped:
+		cfg, err := m.store.RemoveMount(name, cleanTarget)
+		if err != nil {
+			return model.JailStatus{}, err
+		}
+		return m.statusLocked(cfg), nil
 
-	if st, active := m.stages[name]; active {
-		if err := m.withWritableStage(st, func() error {
-			return m.hidePathLocked(st, cleanTarget)
+	case stateMounted, stateAddingPkgMounted:
+		cfg, err := m.store.RemoveMount(name, cleanTarget)
+		if err != nil {
+			return model.JailStatus{}, err
+		}
+		if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
+			return m.hidePathLocked(ws, cleanTarget)
 		}); err != nil {
 			return model.JailStatus{}, err
 		}
+		return m.statusLocked(cfg), nil
+
+	case stateDeleting:
+		return model.JailStatus{}, ErrJailBusy
+
+	default:
+		return model.JailStatus{}, fmt.Errorf("unexpected jail state %d", rt.state)
 	}
-	return m.statusLocked(cfg), nil
+}
+
+func (m *Manager) beginAddPackagesLocked(name string) (context.Context, error) {
+	if _, err := m.store.Get(name); err != nil {
+		return nil, err
+	}
+	rt := m.runtimeLocked(name)
+	switch rt.state {
+	case stateStopped:
+		rt.state = stateAddingPkgStopped
+	case stateMounted:
+		rt.state = stateAddingPkgMounted
+	case stateAddingPkgStopped, stateAddingPkgMounted, stateDeleting:
+		return nil, ErrJailBusy
+	default:
+		return nil, fmt.Errorf("unexpected jail state %d", rt.state)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	rt.pkgCancel = cancel
+	rt.pkgProgress = "resolving package closure..."
+	return ctx, nil
+}
+
+func (m *Manager) finishAddPackagesLocked(name string) {
+	rt, ok := m.jails[name]
+	if !ok {
+		return
+	}
+	if rt.pkgCancel != nil {
+		rt.pkgCancel()
+		rt.pkgCancel = nil
+	}
+	rt.pkgProgress = ""
+	switch rt.state {
+	case stateAddingPkgStopped:
+		rt.state = stateStopped
+	case stateAddingPkgMounted:
+		rt.state = stateMounted
+	}
 }
 
 func (m *Manager) AddPackagesAsync(name string, specs []string) error {
 	m.mu.Lock()
-	if _, err := m.store.Get(name); err != nil {
-		m.mu.Unlock()
+	ctx, err := m.beginAddPackagesLocked(name)
+	m.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	m.mu.Unlock()
 
 	go func() {
-		if _, err := m.AddPackages(name, specs); err != nil {
-			m.broadcast(model.Event{
-				Type:  "pkg_error",
-				Jail:  name,
-				Error: err.Error(),
-			})
+		if _, err := m.runAddPackages(ctx, name, specs); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				m.broadcast(model.Event{
+					Type:  "pkg_error",
+					Jail:  name,
+					Error: err.Error(),
+				})
+			}
 			return
 		}
 		m.broadcast(model.Event{
@@ -322,14 +515,15 @@ func (m *Manager) AddPackagesAsync(name string, specs []string) error {
 
 func (m *Manager) AddPackages(name string, specs []string) (model.JailStatus, error) {
 	m.mu.Lock()
-	if _, err := m.store.Get(name); err != nil {
-		m.mu.Unlock()
+	ctx, err := m.beginAddPackagesLocked(name)
+	m.mu.Unlock()
+	if err != nil {
 		return model.JailStatus{}, err
 	}
-	m.pkgBusy[name]++
-	m.pkgProgress[name] = "resolving package closure..."
-	m.mu.Unlock()
+	return m.runAddPackages(ctx, name, specs)
+}
 
+func (m *Manager) runAddPackages(ctx context.Context, name string, specs []string) (model.JailStatus, error) {
 	m.broadcast(model.Event{
 		Type:    "pkg_progress",
 		Jail:    name,
@@ -338,17 +532,18 @@ func (m *Manager) AddPackages(name string, specs []string) (model.JailStatus, er
 
 	defer func() {
 		m.mu.Lock()
-		m.pkgBusy[name]--
-		if m.pkgBusy[name] <= 0 {
-			delete(m.pkgBusy, name)
-			delete(m.pkgProgress, name)
-		}
+		m.finishAddPackagesLocked(name)
 		m.mu.Unlock()
 	}()
 
 	onProgress := func(msg string) {
 		m.mu.Lock()
-		m.pkgProgress[name] = msg
+		rt, ok := m.jails[name]
+		if !ok || !rt.state.isAddingPkg() {
+			m.mu.Unlock()
+			return
+		}
+		rt.pkgProgress = msg
 		m.mu.Unlock()
 		m.broadcast(model.Event{
 			Type:    "pkg_progress",
@@ -359,28 +554,49 @@ func (m *Manager) AddPackages(name string, specs []string) (model.JailStatus, er
 
 	var resolvedRoots []string
 	for _, spec := range specs {
-		roots, err := ResolveInstallableOrPathWithProgress(spec, onProgress)
+		roots, err := ResolveInstallableOrPathWithProgress(ctx, spec, onProgress)
 		if err != nil {
 			return model.JailStatus{}, err
 		}
-		resolvedRoots = append(resolvedRoots, roots...)
+		for _, r := range roots {
+			if !slices.Contains(resolvedRoots, r) {
+				resolvedRoots = append(resolvedRoots, r)
+			}
+		}
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return model.JailStatus{}, err
+	}
+	rt, ok := m.jails[name]
+	if !ok || !rt.state.isAddingPkg() {
+		return model.JailStatus{}, context.Canceled
+	}
 
 	cfg, err := m.store.AddPackages(name, resolvedRoots)
 	if err != nil {
 		return model.JailStatus{}, err
 	}
 
-	if st, active := m.stages[name]; active && cfg.NixMode == model.NixModeClosure {
-		if err := m.withWritableStage(st, func() error {
-			return m.exposeClosureRootsLocked(st, resolvedRoots)
-		}); err != nil {
-			return model.JailStatus{}, err
+	if rt.state == stateAddingPkgMounted && rt.stage != nil {
+		if cfg.NixMode == model.NixModeClosure {
+			if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
+				return m.exposeClosureRootsLocked(ctx, ws, resolvedRoots)
+			}); err != nil {
+				return model.JailStatus{}, err
+			}
+		} else {
+			for _, b := range CollectBinPaths(resolvedRoots) {
+				if !slices.Contains(rt.stage.binPaths, b) {
+					rt.stage.binPaths = append(rt.stage.binPaths, b)
+				}
+			}
 		}
 	}
+
 	return m.statusLocked(cfg), nil
 }
 
@@ -392,9 +608,21 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 	if err != nil {
 		return model.RunSpec{}, err
 	}
-	st, err := m.ensureStageLocked(cfg)
-	if err != nil {
-		return model.RunSpec{}, err
+	rt := m.runtimeLocked(name)
+
+	var st *stageState
+	switch rt.state {
+	case stateStopped:
+		st, err = m.ensureStageLocked(cfg, rt)
+		if err != nil {
+			return model.RunSpec{}, err
+		}
+	case stateMounted, stateAddingPkgMounted:
+		st = rt.stage
+	case stateAddingPkgStopped, stateDeleting:
+		return model.RunSpec{}, ErrJailBusy
+	default:
+		return model.RunSpec{}, fmt.Errorf("unexpected jail state %d", rt.state)
 	}
 
 	bwrapPath, err := exec.LookPath("bwrap")
@@ -520,9 +748,9 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 	}, nil
 }
 
-func (m *Manager) ensureStageLocked(cfg model.JailConfig) (*stageState, error) {
-	if st, ok := m.stages[cfg.Name]; ok {
-		return st, nil
+func (m *Manager) ensureStageLocked(cfg model.JailConfig, rt *jailRuntime) (*stageState, error) {
+	if rt.stage != nil {
+		return rt.stage, nil
 	}
 
 	stageDir := filepath.Join(m.rootDir, cfg.Name, "stage")
@@ -540,25 +768,93 @@ func (m *Manager) ensureStageLocked(cfg model.JailConfig) (*stageState, error) {
 
 	st := &stageState{
 		stageDir:    stageDir,
+		mountState:  stageMountedRW,
+		rwDepth:     1,
 		mounted:     make(map[string]bool),
 		storeMounts: make(map[string]bool),
 	}
+	rt.stage = st
 
-	if err := m.populateStageLocked(cfg, st); err != nil {
-		_ = m.teardownStageLocked(cfg.Name, st)
+	if err := m.populateStageLocked(cfg, writableStage{st}); err != nil {
+		_ = m.teardownStageLocked(cfg.Name, rt)
 		return nil, err
 	}
 
 	if err := remountBind(stageDir, true); err != nil {
-		_ = m.teardownStageLocked(cfg.Name, st)
+		_ = m.teardownStageLocked(cfg.Name, rt)
 		return nil, fmt.Errorf("remount stage ro %s: %w", stageDir, err)
 	}
+	st.mountState = stageMountedRO
+	st.rwDepth = 0
 
-	m.stages[cfg.Name] = st
+	if rt.state == stateStopped {
+		rt.state = stateMounted
+	}
 	return st, nil
 }
 
-func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) error {
+func (m *Manager) teardownStageLocked(name string, rt *jailRuntime) error {
+	st := rt.stage
+	if st == nil {
+		return nil
+	}
+	if st.dbusProxy != nil && st.dbusProxy.Process != nil {
+		_ = st.dbusProxy.Process.Kill()
+		_ = st.dbusProxy.Wait()
+	}
+	if st.dbusSock != "" {
+		_ = os.Remove(st.dbusSock)
+	}
+	if st.mountState != stageUnmounted {
+		if err := syscall.Unmount(st.stageDir, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
+			return fmt.Errorf("unmount stage %s: %w", st.stageDir, err)
+		}
+		st.mountState = stageUnmounted
+		st.rwDepth = 0
+	}
+	_ = os.Remove(st.stageDir)
+	_ = os.Remove(filepath.Join(m.rootDir, name))
+	rt.stage = nil
+	switch rt.state {
+	case stateMounted:
+		rt.state = stateStopped
+	case stateAddingPkgMounted:
+		rt.state = stateAddingPkgStopped
+	}
+	return nil
+}
+
+func (m *Manager) withWritableStage(st *stageState, fn func(ws writableStage) error) error {
+	if st == nil {
+		return errors.New("stage is not mounted")
+	}
+	switch st.mountState {
+	case stageUnmounted:
+		return errors.New("cannot write to unmounted stage")
+	case stageMountedRO:
+		if err := remountBind(st.stageDir, false); err != nil {
+			return fmt.Errorf("remount stage rw: %w", err)
+		}
+		st.mountState = stageMountedRW
+		st.rwDepth = 1
+	case stageMountedRW:
+		st.rwDepth++
+	default:
+		return fmt.Errorf("unexpected stage mount state %d", st.mountState)
+	}
+
+	defer func() {
+		st.rwDepth--
+		if st.rwDepth == 0 && st.mountState == stageMountedRW {
+			_ = remountBind(st.stageDir, true)
+			st.mountState = stageMountedRO
+		}
+	}()
+
+	return fn(writableStage{st})
+}
+
+func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) error {
 	jailRuntime := fmt.Sprintf("/run/user/%d", m.hostUID)
 	baseDirs := []string{
 		"/proc",
@@ -576,15 +872,15 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 		cfg.Home,
 	}
 	for _, d := range baseDirs {
-		if err := os.MkdirAll(filepath.Join(st.stageDir, d), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Join(ws.stageDir, d), 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", d, err)
 		}
 	}
 
-	if err := syscall.Mount("tmpfs", filepath.Join(st.stageDir, "tmp"), "tmpfs", 0, "mode=1777"); err != nil {
+	if err := syscall.Mount("tmpfs", filepath.Join(ws.stageDir, "tmp"), "tmpfs", 0, "mode=1777"); err != nil {
 		return fmt.Errorf("mount /tmp in stage: %w", err)
 	}
-	if err := syscall.Mount("tmpfs", filepath.Join(st.stageDir, jailRuntime), "tmpfs", 0, "mode=0700"); err != nil {
+	if err := syscall.Mount("tmpfs", filepath.Join(ws.stageDir, jailRuntime), "tmpfs", 0, "mode=0700"); err != nil {
 		return fmt.Errorf("mount %s in stage: %w", jailRuntime, err)
 	}
 
@@ -592,11 +888,11 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 		if err := os.MkdirAll(cfg.HomeSrc, 0o700); err != nil {
 			return fmt.Errorf("mkdir home_src %s: %w", cfg.HomeSrc, err)
 		}
-		if err := m.exposePathLocked(st, cfg.HomeSrc, cfg.Home, false); err != nil {
+		if err := m.exposePathLocked(ws, cfg.HomeSrc, cfg.Home, false); err != nil {
 			return fmt.Errorf("bind home_src: %w", err)
 		}
 	} else {
-		if err := syscall.Mount("tmpfs", filepath.Join(st.stageDir, cfg.Home), "tmpfs", 0, "mode=0700"); err != nil {
+		if err := syscall.Mount("tmpfs", filepath.Join(ws.stageDir, cfg.Home), "tmpfs", 0, "mode=0700"); err != nil {
 			return fmt.Errorf("mount home tmpfs: %w", err)
 		}
 	}
@@ -604,29 +900,29 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 	passwd := fmt.Sprintf("root:x:0:0:root:/root:/bin/sh\n%s:x:%d:%d::%s:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n",
 		cfg.User, m.hostUID, m.hostGID, cfg.Home)
 	group := fmt.Sprintf("root:x:0:\n%s:x:%d:\nnogroup:x:65534:\n", cfg.User, m.hostGID)
-	if err := os.WriteFile(filepath.Join(st.stageDir, "etc/passwd"), []byte(passwd), 0o444); err != nil {
+	if err := os.WriteFile(filepath.Join(ws.stageDir, "etc/passwd"), []byte(passwd), 0o444); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(st.stageDir, "etc/group"), []byte(group), 0o444); err != nil {
+	if err := os.WriteFile(filepath.Join(ws.stageDir, "etc/group"), []byte(group), 0o444); err != nil {
 		return err
 	}
 
 	shPath := resolveHostBin("bash", "sh")
 	if shPath != "" {
-		_ = os.Symlink(shPath, filepath.Join(st.stageDir, "bin/sh"))
+		_ = os.Symlink(shPath, filepath.Join(ws.stageDir, "bin/sh"))
 	}
 	envPath := resolveHostBin("env")
 	if envPath != "" {
-		_ = os.Symlink(envPath, filepath.Join(st.stageDir, "usr/bin/env"))
+		_ = os.Symlink(envPath, filepath.Join(ws.stageDir, "usr/bin/env"))
 	}
 
 	for _, p := range []string{"/etc/os-release", "/etc/localtime", "/etc/nix"} {
-		m.exposeIfExistsLocked(st, p, p, true)
+		m.exposeIfExistsLocked(ws, p, p, true)
 	}
 
 	if m.hostHome != "" {
-		m.exposeIfExistsLocked(st, filepath.Join(m.hostHome, ".gitconfig"), filepath.Join(cfg.Home, ".gitconfig"), true)
-		m.exposeIfExistsLocked(st, filepath.Join(m.hostHome, ".config/git"), filepath.Join(cfg.Home, ".config/git"), true)
+		m.exposeIfExistsLocked(ws, filepath.Join(m.hostHome, ".gitconfig"), filepath.Join(cfg.Home, ".gitconfig"), true)
+		m.exposeIfExistsLocked(ws, filepath.Join(m.hostHome, ".config/git"), filepath.Join(cfg.Home, ".config/git"), true)
 	}
 
 	if cfg.Network {
@@ -638,44 +934,44 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 			"/etc/pki",
 			"/run/systemd/resolve",
 		} {
-			m.exposeIfExistsLocked(st, p, p, true)
+			m.exposeIfExistsLocked(ws, p, p, true)
 		}
 	}
 
 	if cfg.GUI {
-		m.exposeIfExistsLocked(st, "/tmp/.X11-unix", "/tmp/.X11-unix", false)
-		m.exposeIfExistsLocked(st, "/etc/fonts", "/etc/fonts", true)
-		m.exposeIfExistsLocked(st, "/etc/machine-id", "/etc/machine-id", true)
+		m.exposeIfExistsLocked(ws, "/tmp/.X11-unix", "/tmp/.X11-unix", false)
+		m.exposeIfExistsLocked(ws, "/etc/fonts", "/etc/fonts", true)
+		m.exposeIfExistsLocked(ws, "/etc/machine-id", "/etc/machine-id", true)
 		xauth := os.Getenv("XAUTHORITY")
 		if xauth == "" && m.hostHome != "" {
 			xauth = filepath.Join(m.hostHome, ".Xauthority")
 		}
 		if xauth != "" {
-			m.exposeIfExistsLocked(st, xauth, filepath.Join(jailRuntime, "Xauthority"), true)
+			m.exposeIfExistsLocked(ws, xauth, filepath.Join(jailRuntime, "Xauthority"), true)
 		}
 	}
 
 	if cfg.GPU {
-		m.exposeIfExistsLocked(st, "/sys", "/sys", true)
-		m.exposeIfExistsLocked(st, "/run/opengl-driver", "/run/opengl-driver", true)
-		m.exposeIfExistsLocked(st, "/run/opengl-driver-32", "/run/opengl-driver-32", true)
+		m.exposeIfExistsLocked(ws, "/sys", "/sys", true)
+		m.exposeIfExistsLocked(ws, "/run/opengl-driver", "/run/opengl-driver", true)
+		m.exposeIfExistsLocked(ws, "/run/opengl-driver-32", "/run/opengl-driver-32", true)
 	}
 
 	if len(cfg.DBusTalk) > 0 {
-		if err := m.setupDBusProxyLocked(cfg, st, jailRuntime); err != nil {
+		if err := m.setupDBusProxyLocked(cfg, ws, jailRuntime); err != nil {
 			return err
 		}
 	}
 
 	if cfg.NixMode == model.NixModeFull {
-		m.exposeIfExistsLocked(st, "/nix/store", "/nix/store", true)
-		m.exposeIfExistsLocked(st, "/nix/var", "/nix/var", true)
-		m.exposeIfExistsLocked(st, "/run/current-system", "/run/current-system", true)
+		m.exposeIfExistsLocked(ws, "/nix/store", "/nix/store", true)
+		m.exposeIfExistsLocked(ws, "/nix/var", "/nix/var", true)
+		m.exposeIfExistsLocked(ws, "/run/current-system", "/run/current-system", true)
 		for _, spec := range cfg.Packages {
 			if roots, err := ResolveInstallableOrPath(spec); err == nil {
 				for _, b := range CollectBinPaths(roots) {
-					if !slices.Contains(st.binPaths, b) {
-						st.binPaths = append(st.binPaths, b)
+					if !slices.Contains(ws.binPaths, b) {
+						ws.binPaths = append(ws.binPaths, b)
 					}
 				}
 			}
@@ -712,7 +1008,7 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 				}
 			}
 		}
-		if err := m.exposeClosureRootsLocked(st, roots); err != nil {
+		if err := m.exposeClosureRootsLocked(context.Background(), ws, roots); err != nil {
 			return err
 		}
 	}
@@ -721,7 +1017,7 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 		if _, err := os.Stat(mnt.Path); err != nil {
 			continue
 		}
-		if err := m.exposePathLocked(st, mnt.Path, mnt.Target, mnt.ReadOnly); err != nil {
+		if err := m.exposePathLocked(ws, mnt.Path, mnt.Target, mnt.ReadOnly); err != nil {
 			return err
 		}
 	}
@@ -729,32 +1025,32 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 	return nil
 }
 
-func (m *Manager) exposeClosureRootsLocked(st *stageState, roots []string) error {
+func (m *Manager) exposeClosureRootsLocked(ctx context.Context, ws writableStage, roots []string) error {
 	for _, b := range CollectBinPaths(roots) {
-		if !slices.Contains(st.binPaths, b) {
-			st.binPaths = append(st.binPaths, b)
+		if !slices.Contains(ws.binPaths, b) {
+			ws.binPaths = append(ws.binPaths, b)
 		}
 	}
-	closure, err := QueryClosure(roots)
+	closure, err := QueryClosure(ctx, roots)
 	if err != nil {
 		return err
 	}
 	for _, p := range closure {
-		if st.storeMounts[p] {
+		if ws.storeMounts[p] {
 			continue
 		}
 		if _, err := os.Stat(p); err != nil {
 			continue
 		}
-		if err := m.exposePathLocked(st, p, p, true); err != nil {
+		if err := m.exposePathLocked(ws, p, p, true); err != nil {
 			return fmt.Errorf("expose store path %s: %w", p, err)
 		}
-		st.storeMounts[p] = true
+		ws.storeMounts[p] = true
 	}
 	return nil
 }
 
-func (m *Manager) setupDBusProxyLocked(cfg model.JailConfig, st *stageState, jailRuntime string) error {
+func (m *Manager) setupDBusProxyLocked(cfg model.JailConfig, ws writableStage, jailRuntime string) error {
 	busAddr := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
 	if busAddr == "" {
 		busPath := filepath.Join(jailRuntime, "bus")
@@ -793,22 +1089,12 @@ func (m *Manager) setupDBusProxyLocked(cfg model.JailConfig, st *stageState, jai
 	buf := make([]byte, 1)
 	_, _ = rPipe.Read(buf)
 
-	st.dbusProxy = cmd
-	st.dbusSock = sockPath
-	return m.exposePathLocked(st, sockPath, filepath.Join(jailRuntime, "bus"), false)
+	ws.dbusProxy = cmd
+	ws.dbusSock = sockPath
+	return m.exposePathLocked(ws, sockPath, filepath.Join(jailRuntime, "bus"), false)
 }
 
-func (m *Manager) withWritableStage(st *stageState, fn func() error) error {
-	if err := remountBind(st.stageDir, false); err != nil {
-		return fmt.Errorf("remount stage rw: %w", err)
-	}
-	defer func() {
-		_ = remountBind(st.stageDir, true)
-	}()
-	return fn()
-}
-
-func (m *Manager) exposeIfExistsLocked(st *stageState, srcPath, dstPath string, ro bool) {
+func (m *Manager) exposeIfExistsLocked(ws writableStage, srcPath, dstPath string, ro bool) {
 	resolved, err := filepath.EvalSymlinks(srcPath)
 	if err != nil {
 		return
@@ -816,10 +1102,13 @@ func (m *Manager) exposeIfExistsLocked(st *stageState, srcPath, dstPath string, 
 	if _, err := os.Stat(resolved); err != nil {
 		return
 	}
-	_ = m.exposePathLocked(st, resolved, dstPath, ro)
+	_ = m.exposePathLocked(ws, resolved, dstPath, ro)
 }
 
-func (m *Manager) exposePathLocked(st *stageState, srcPath, dstPath string, ro bool) error {
+func (m *Manager) exposePathLocked(ws writableStage, srcPath, dstPath string, ro bool) error {
+	if ws.mountState != stageMountedRW {
+		return errors.New("stage must be writable to expose paths")
+	}
 	resolvedSrc, err := filepath.EvalSymlinks(srcPath)
 	if err != nil {
 		resolvedSrc = srcPath
@@ -859,8 +1148,8 @@ func (m *Manager) exposePathLocked(st *stageState, srcPath, dstPath string, ro b
 		}
 	}
 
-	stageTarget := filepath.Join(st.stageDir, dstPath)
-	if st.mounted[dstPath] {
+	stageTarget := filepath.Join(ws.stageDir, dstPath)
+	if ws.mounted[dstPath] {
 		_ = syscall.Unmount(stageTarget, syscall.MNT_DETACH)
 	}
 
@@ -887,17 +1176,20 @@ func (m *Manager) exposePathLocked(st *stageState, srcPath, dstPath string, ro b
 		return fmt.Errorf("mount --move %s -> %s: %w", workTarget, stageTarget, err)
 	}
 
-	st.mounted[dstPath] = true
+	ws.mounted[dstPath] = true
 	return nil
 }
 
-func (m *Manager) hidePathLocked(st *stageState, dstPath string) error {
-	stageTarget := filepath.Join(st.stageDir, dstPath)
+func (m *Manager) hidePathLocked(ws writableStage, dstPath string) error {
+	if ws.mountState != stageMountedRW {
+		return errors.New("stage must be writable to hide paths")
+	}
+	stageTarget := filepath.Join(ws.stageDir, dstPath)
 	if err := syscall.Unmount(stageTarget, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
 		return fmt.Errorf("unmount %s: %w", stageTarget, err)
 	}
 	_ = os.Remove(stageTarget)
-	delete(st.mounted, dstPath)
+	delete(ws.mounted, dstPath)
 	return nil
 }
 
