@@ -29,8 +29,8 @@ func TestTOMLCodecRoundTrip(t *testing.T) {
 			"COMPLEX": `hello "world" # not a comment`,
 		},
 		Mounts: []model.MountEntry{
-			{Path: "/mnt/data", ReadOnly: false},
-			{Path: "/mnt/models", ReadOnly: true},
+			{Path: "/mnt/data", Target: "/mnt/data", ReadOnly: false},
+			{Path: "/mnt/models", Target: "/models", ReadOnly: true},
 		},
 	}
 
@@ -69,7 +69,7 @@ func TestTOMLStoreCRUD(t *testing.T) {
 		t.Fatalf("expected comfy.toml on disk: %v", err)
 	}
 
-	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", ReadOnly: true})
+	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", Target: "/mnt/models", ReadOnly: true})
 	if err != nil {
 		t.Fatalf("SetMount: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestTOMLStoreCRUD(t *testing.T) {
 		t.Fatalf("unexpected mounts: %#v", cfg.Mounts)
 	}
 
-	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", ReadOnly: false})
+	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", Target: "/mnt/models", ReadOnly: false})
 	if err != nil {
 		t.Fatalf("SetMount update: %v", err)
 	}

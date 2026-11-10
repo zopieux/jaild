@@ -142,7 +142,7 @@ func (s *TOMLStore) SetMount(name string, entry model.MountEntry) (model.JailCon
 	}
 	replaced := false
 	for i := range cfg.Mounts {
-		if cfg.Mounts[i].Path == entry.Path {
+		if cfg.Mounts[i].Target == entry.Target {
 			cfg.Mounts[i] = entry
 			replaced = true
 			break
@@ -154,7 +154,7 @@ func (s *TOMLStore) SetMount(name string, entry model.MountEntry) (model.JailCon
 	return s.writeOneLocked(cfg)
 }
 
-func (s *TOMLStore) RemoveMount(name, path string) (model.JailConfig, error) {
+func (s *TOMLStore) RemoveMount(name, target string) (model.JailConfig, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg, err := s.readOneLocked(name)
@@ -162,7 +162,7 @@ func (s *TOMLStore) RemoveMount(name, path string) (model.JailConfig, error) {
 		return model.JailConfig{}, err
 	}
 	cfg.Mounts = slices.DeleteFunc(cfg.Mounts, func(m model.MountEntry) bool {
-		return m.Path == path
+		return m.Target == target
 	})
 	return s.writeOneLocked(cfg)
 }
@@ -238,6 +238,7 @@ func EncodeTOML(cfg model.JailConfig) string {
 	for _, m := range cfg.Mounts {
 		b.WriteString("\n[[mounts]]\n")
 		writeKV("path", m.Path)
+		writeKV("target", m.Target)
 		writeBool("ro", m.ReadOnly)
 	}
 
@@ -316,6 +317,12 @@ func DecodeTOML(input string) (model.JailConfig, error) {
 					return cfg, fmt.Errorf("line %d: mounts.path: %w", lineNo+1, err)
 				}
 				curMount.Path = v
+			case "target":
+				v, err := parseTOMLString(valStr)
+				if err != nil {
+					return cfg, fmt.Errorf("line %d: mounts.target: %w", lineNo+1, err)
+				}
+				curMount.Target = v
 			case "ro":
 				v, err := strconv.ParseBool(valStr)
 				if err != nil {

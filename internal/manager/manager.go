@@ -235,7 +235,7 @@ func (m *Manager) teardownStageLocked(name string, st *stageState) error {
 	return nil
 }
 
-func (m *Manager) Expose(name, rawPath string, ro bool) (model.JailStatus, error) {
+func (m *Manager) Expose(name, rawPath, rawTarget string, ro bool) (model.JailStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -247,59 +247,52 @@ func (m *Manager) Expose(name, rawPath string, ro bool) (model.JailStatus, error
 		return model.JailStatus{}, fmt.Errorf("source path %q: %w", cleanPath, err)
 	}
 
-	cfg, err := m.store.SetMount(name, model.MountEntry{Path: cleanPath, ReadOnly: ro})
+	cleanTarget := cleanPath
+	if strings.TrimSpace(rawTarget) != "" {
+		cleanTarget = filepath.Clean(strings.TrimSpace(rawTarget))
+		if !filepath.IsAbs(cleanTarget) {
+			return model.JailStatus{}, fmt.Errorf("target path must be absolute: %q", rawTarget)
+		}
+	}
+
+	entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadOnly: ro}
+	cfg, err := m.store.SetMount(name, entry)
 	if err != nil {
 		return model.JailStatus{}, err
 	}
 
-	st, active := m.stages[name]
-	storeCount := 0
-	if active {
+	if st, active := m.stages[name]; active {
 		if err := m.withWritableStage(st, func() error {
-			return m.exposePathLocked(st, cleanPath, cleanPath, ro)
+			return m.exposePathLocked(st, entry.Path, entry.Target, ro)
 		}); err != nil {
 			return model.JailStatus{}, err
 		}
-		storeCount = len(st.storeMounts)
 	}
-	return model.JailStatus{
-		Config:     cfg,
-		Active:     active,
-		StagePath:  filepath.Join(m.rootDir, name, "stage"),
-		StorePaths: storeCount,
-	}, nil
+	return m.statusLocked(cfg), nil
 }
 
-func (m *Manager) Hide(name, rawPath string) (model.JailStatus, error) {
+func (m *Manager) Hide(name, rawTarget string) (model.JailStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	cleanPath := filepath.Clean(rawPath)
-	if !filepath.IsAbs(cleanPath) {
-		return model.JailStatus{}, fmt.Errorf("path must be absolute: %q", rawPath)
+	cleanTarget := filepath.Clean(rawTarget)
+	if !filepath.IsAbs(cleanTarget) {
+		return model.JailStatus{}, fmt.Errorf("path must be absolute: %q", rawTarget)
 	}
 
-	cfg, err := m.store.RemoveMount(name, cleanPath)
+	cfg, err := m.store.RemoveMount(name, cleanTarget)
 	if err != nil {
 		return model.JailStatus{}, err
 	}
 
-	st, active := m.stages[name]
-	storeCount := 0
-	if active {
+	if st, active := m.stages[name]; active {
 		if err := m.withWritableStage(st, func() error {
-			return m.hidePathLocked(st, cleanPath)
+			return m.hidePathLocked(st, cleanTarget)
 		}); err != nil {
 			return model.JailStatus{}, err
 		}
-		storeCount = len(st.storeMounts)
 	}
-	return model.JailStatus{
-		Config:     cfg,
-		Active:     active,
-		StagePath:  filepath.Join(m.rootDir, name, "stage"),
-		StorePaths: storeCount,
-	}, nil
+	return m.statusLocked(cfg), nil
 }
 
 func (m *Manager) AddPackagesAsync(name string, specs []string) error {
@@ -457,7 +450,7 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 	if req.Cwd != "" {
 		for _, mnt := range cfg.Mounts {
 			if req.Cwd == mnt.Path || strings.HasPrefix(req.Cwd, mnt.Path+"/") {
-				jailCwd = req.Cwd
+				jailCwd = mnt.Target + strings.TrimPrefix(req.Cwd, mnt.Path)
 				break
 			}
 		}
@@ -728,7 +721,7 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, st *stageState) erro
 		if _, err := os.Stat(mnt.Path); err != nil {
 			continue
 		}
-		if err := m.exposePathLocked(st, mnt.Path, mnt.Path, mnt.ReadOnly); err != nil {
+		if err := m.exposePathLocked(st, mnt.Path, mnt.Target, mnt.ReadOnly); err != nil {
 			return err
 		}
 	}

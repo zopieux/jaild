@@ -253,22 +253,33 @@ func openBwrapArgsFD(args []string) (int, error) {
 
 func cmdExpose(cli *client.Client, args []string) error {
 	var ro bool
+	var target string
 	var positional []string
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--ro" || a == "-ro" || (len(positional) == 2 && a == "ro") {
 			ro = true
+		} else if (a == "--target" || a == "-t") && i+1 < len(args) {
+			i++
+			target = args[i]
 		} else {
 			positional = append(positional, a)
 		}
 	}
 	if len(positional) != 2 {
-		return fmt.Errorf("usage: jail expose <name> <path> [ro|--ro]")
+		return fmt.Errorf("usage: jail expose <name> <path> [--target JAIL_PATH] [ro|--ro]")
 	}
 	absPath, err := filepath.Abs(positional[1])
 	if err != nil {
 		return err
 	}
-	_, err = cli.Expose(positional[0], absPath, ro)
+	if target != "" {
+		target, err = filepath.Abs(target)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = cli.Expose(positional[0], absPath, target, ro)
 	return err
 }
 

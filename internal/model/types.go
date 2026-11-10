@@ -9,6 +9,7 @@ const (
 
 type MountEntry struct {
 	Path     string `json:"path" toml:"path"`
+	Target   string `json:"target" toml:"target"`
 	ReadOnly bool   `json:"ro" toml:"ro"`
 }
 
