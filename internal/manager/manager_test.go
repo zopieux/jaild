@@ -115,12 +115,19 @@ func TestManagerDeletedHostFoldersAreStrictlyScoped(t *testing.T) {
 
 	var mu sync.Mutex
 	var removedPaths []string
+	stageDir := filepath.Join(rootDir, "dev", "stage")
 
 	sys := sysOps{
 		mount: func(source, target, fstype string, flags uintptr, data string) error {
 			return nil
 		},
 		unmount: func(target string, flags int) error {
+			if target == stageDir {
+				entries, _ := os.ReadDir(stageDir)
+				for _, e := range entries {
+					_ = os.RemoveAll(filepath.Join(stageDir, e.Name()))
+				}
+			}
 			return nil
 		},
 		statfs: func(path string, buf *syscall.Statfs_t) error {
@@ -167,7 +174,6 @@ func TestManagerDeletedHostFoldersAreStrictlyScoped(t *testing.T) {
 		t.Fatalf("Expose file: %v", err)
 	}
 
-	stageDir := filepath.Join(rootDir, "dev", "stage")
 	simulatedBoundSubdir := filepath.Join(stageDir, "work/project/empty-subdir")
 	if err := os.MkdirAll(simulatedBoundSubdir, 0o755); err != nil {
 		t.Fatalf("mkdir simulatedBoundSubdir: %v", err)
@@ -272,5 +278,98 @@ func TestManagerDeletedHostFoldersAreStrictlyScoped(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("host path %q was unexpectedly deleted or missing: %v", p, err)
 		}
+	}
+}
+
+func TestCreateOrUpdateOverwritesExistingJailAndRemountsStage(t *testing.T) {
+	base := t.TempDir()
+	storeDir := filepath.Join(base, "store")
+	rootDir := filepath.Join(base, "root")
+	workDir := filepath.Join(base, "work")
+	hostDir := filepath.Join(base, "host-dir")
+	if err := os.MkdirAll(hostDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	st, err := store.NewTOMLStore(storeDir)
+	if err != nil {
+		t.Fatalf("NewTOMLStore: %v", err)
+	}
+
+	stageUnmounts := 0
+	stageDir := filepath.Join(rootDir, "dev", "stage")
+	sys := sysOps{
+		mount: func(source, target, fstype string, flags uintptr, data string) error {
+			return nil
+		},
+		unmount: func(target string, flags int) error {
+			if target == stageDir {
+				stageUnmounts++
+				entries, _ := os.ReadDir(stageDir)
+				for _, e := range entries {
+					_ = os.RemoveAll(filepath.Join(stageDir, e.Name()))
+				}
+			}
+			return nil
+		},
+		statfs: func(path string, buf *syscall.Statfs_t) error {
+			return nil
+		},
+		remove: os.Remove,
+	}
+
+	mgr, err := newWithSys(Options{
+		Store:    st,
+		RootDir:  rootDir,
+		WorkDir:  workDir,
+		HostUID:  1000,
+		HostGID:  1000,
+		HostUser: "someuser",
+	}, sys)
+	if err != nil {
+		t.Fatalf("newWithSys: %v", err)
+	}
+
+	if _, err := mgr.CreateOrUpdateJail(model.JailConfig{
+		Name:    "dev",
+		User:    "firstuser",
+		Network: true,
+		GPU:     true,
+		NixMode: model.NixModeFull,
+	}); err != nil {
+		t.Fatalf("first CreateOrUpdateJail: %v", err)
+	}
+	if _, err := mgr.EnsureStage("dev"); err != nil {
+		t.Fatalf("EnsureStage: %v", err)
+	}
+	if _, err := mgr.Expose("dev", hostDir, "/work/data", true); err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+
+	updated, err := mgr.CreateOrUpdateJail(model.JailConfig{
+		Name:    "dev",
+		User:    "seconduser",
+		Network: false,
+		GPU:     false,
+		NixMode: model.NixModeFull,
+	})
+	if err != nil {
+		t.Fatalf("second CreateOrUpdateJail: %v", err)
+	}
+
+	if updated.Config.User != "seconduser" || updated.Config.Home != "/home/seconduser" {
+		t.Fatalf("expected user/home to be overwritten, got %#v", updated.Config)
+	}
+	if updated.Config.Network || updated.Config.GPU {
+		t.Fatalf("expected network/gpu flags to be reset, got %#v", updated.Config)
+	}
+	if len(updated.Config.Mounts) != 0 || len(updated.Config.Packages) != 0 {
+		t.Fatalf("expected previous mounts and packages to be cleared, got %#v", updated.Config)
+	}
+	if !updated.Active || stageUnmounts != 1 {
+		t.Fatalf("expected active stage to be torn down and remounted once (active=%v, unmounts=%d)", updated.Active, stageUnmounts)
+	}
+	if mgr.jails["dev"].stage.mounted["/work/data"] {
+		t.Fatalf("expected remounted stage not to retain old /work/data mount")
 	}
 }

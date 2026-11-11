@@ -103,12 +103,17 @@ func TestTOMLStoreCRUD(t *testing.T) {
 		t.Fatalf("expected deduplicated packages: %#v", cfg.Packages)
 	}
 
-	cfg, err = s.RemoveMount("comfy", "/mnt/models")
+	overwritten, err := s.Put(model.JailConfig{
+		Name:    "comfy",
+		User:    "altuser",
+		GPU:     false,
+		Network: true,
+	})
 	if err != nil {
-		t.Fatalf("RemoveMount: %v", err)
+		t.Fatalf("Put overwrite: %v", err)
 	}
-	if len(cfg.Mounts) != 0 {
-		t.Fatalf("expected empty mounts: %#v", cfg.Mounts)
+	if overwritten.User != "altuser" || overwritten.GPU || !overwritten.Network || len(overwritten.Mounts) != 0 || len(overwritten.Packages) != 0 {
+		t.Fatalf("expected Put to overwrite previous config semantics, got: %#v", overwritten)
 	}
 
 	list, err := s.List()

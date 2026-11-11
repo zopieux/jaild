@@ -177,6 +177,14 @@ pkgs.testers.runNixOSTest {
             # Still hidden in web jail
             machine.succeed(as_user(f"jail run web -- test ! -e {hello_bin}"))
 
+        with subtest("re-running jail new on existing jail overwrites config and remounts stage"):
+            hello_bin = "${pkgs.hello}/bin/hello"
+            machine.succeed(as_user("jail new dev --user customuser"))
+            out = machine.succeed(as_user("jail run dev -- sh -ec 'echo $USER:$HOME'")).strip()
+            assert out == "customuser:/home/customuser", f"unexpected user/home: {out}"
+            machine.succeed(as_user("jail run dev -- test ! -e /tmp/host-ro/data"))
+            machine.succeed(as_user(f"jail run dev -- test ! -e {hello_bin}"))
+
         with subtest("embedded web UI and REST API over socket"):
             html = machine.succeed(as_user("curl -sf --unix-socket /run/user/1000/jaild.sock http://localhost/"))
             assert "<title>jaild" in html
