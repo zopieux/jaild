@@ -18,15 +18,16 @@ Rootless `bubblewrap` jail manager for NixOS with live bind-mount and Nix closur
 ### Create a jail
 
 ```sh
-jail new dev --network --gpu --gui --home-src ~/jails/dev-home --pkg nixpkgs#git --pkg nixpkgs#ripgrep
+jail new dev --network --gpu --gui --home ~/jails/dev-home --pkg nixpkgs#git --pkg nixpkgs#ripgrep
 ```
 
 Flags for `jail new <name> [flags] [-- default-cmd...]`:
+- `--user <name>` - username inside the jail (default: jail name)
 - `--network` - share host network
 - `--gpu` - expose `/dev/dri`, `/dev/nvidia*`, and OpenGL/CUDA drivers
 - `--gui` - expose X11 socket and `XAUTHORITY`
 - `--nix-mode closure|full` - mount only required store closures (default: `closure`) or all of `/nix/store` (`full`)
-- `--home-src <dir>` - bind a persistent host directory as `$HOME` (default: ephemeral `tmpfs`)
+- `--home <dir>` - bind a persistent host directory as `$HOME` (default: ephemeral `tmpfs`)
 - `--pkg <installable|path>` - include Nix packages in the jail (repeatable)
 - `--dbus-talk <name>` - allow talking to a session D-Bus service via `xdg-dbus-proxy` (repeatable)
 - `--pass-env <VAR>` - pass a host environment variable into the jail (repeatable)
@@ -46,11 +47,11 @@ jail run dev -- nvim /work/project
 Changes take effect immediately inside already-running `jail run` processes:
 
 ```sh
-# Mirror /mnt/datasets into /mnt/datasets read-only
-jail expose dev /mnt/datasets --ro
+# Mirror /mnt/datasets into /mnt/datasets read-only (default)
+jail expose dev /mnt/datasets
 
 # Expose ~/src/project at /work/project read-write
-jail expose dev ~/src/project --target /work/project
+jail expose dev ~/src/project --target /work/project --rw
 
 # Unmount from the jail (by target path)
 jail hide dev /work/project

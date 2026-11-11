@@ -78,6 +78,22 @@ type jailRuntime struct {
 	pkgProgress string
 }
 
+type sysOps struct {
+	mount   func(source string, target string, fstype string, flags uintptr, data string) error
+	unmount func(target string, flags int) error
+	statfs  func(path string, buf *syscall.Statfs_t) error
+	remove  func(path string) error
+}
+
+func defaultSysOps() sysOps {
+	return sysOps{
+		mount:   syscall.Mount,
+		unmount: syscall.Unmount,
+		statfs:  syscall.Statfs,
+		remove:  os.Remove,
+	}
+}
+
 type Manager struct {
 	mu       sync.Mutex
 	store    store.Store
@@ -88,12 +104,17 @@ type Manager struct {
 	hostUser string
 	hostHome string
 	jails    map[string]*jailRuntime
+	sys      sysOps
 
 	subMu sync.Mutex
 	subs  map[chan model.Event]struct{}
 }
 
 func New(opts Options) (*Manager, error) {
+	return newWithSys(opts, defaultSysOps())
+}
+
+func newWithSys(opts Options, sys sysOps) (*Manager, error) {
 	if opts.Store == nil {
 		return nil, errors.New("manager requires a store")
 	}
@@ -105,19 +126,72 @@ func New(opts Options) (*Manager, error) {
 	}
 	m := &Manager{
 		store:    opts.Store,
-		rootDir:  opts.RootDir,
-		workDir:  opts.WorkDir,
+		rootDir:  filepath.Clean(opts.RootDir),
+		workDir:  filepath.Clean(opts.WorkDir),
 		hostUID:  opts.HostUID,
 		hostGID:  opts.HostGID,
 		hostUser: opts.HostUser,
 		hostHome: opts.HostHome,
 		jails:    make(map[string]*jailRuntime),
+		sys:      sys,
 		subs:     make(map[chan model.Event]struct{}),
 	}
 	if err := m.initWorkspace(); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+func validJailName(name string) bool {
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") || name == "." || name == ".." {
+		return false
+	}
+	return true
+}
+
+func checkStrictSubpath(allowedRoot, target string) error {
+	cleanRoot := filepath.Clean(allowedRoot)
+	cleanTarget := filepath.Clean(target)
+	if !filepath.IsAbs(cleanRoot) || cleanRoot == "/" {
+		return fmt.Errorf("invalid allowed root %q", allowedRoot)
+	}
+	if !filepath.IsAbs(cleanTarget) {
+		return fmt.Errorf("target path must be absolute: %q", target)
+	}
+	if cleanTarget == cleanRoot || !strings.HasPrefix(cleanTarget, cleanRoot+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to remove path %q outside %q", cleanTarget, cleanRoot)
+	}
+	if resolvedRoot, err := filepath.EvalSymlinks(cleanRoot); err == nil {
+		if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(cleanTarget)); err == nil {
+			resolvedRoot = filepath.Clean(resolvedRoot)
+			resolvedParent = filepath.Clean(resolvedParent)
+			if resolvedParent != resolvedRoot && !strings.HasPrefix(resolvedParent, resolvedRoot+string(filepath.Separator)) {
+				return fmt.Errorf("refusing to remove path %q: parent resolves to %q outside %q", cleanTarget, resolvedParent, resolvedRoot)
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) safeRemoveUnder(allowedRoot, target string) error {
+	if err := checkStrictSubpath(allowedRoot, target); err != nil {
+		return err
+	}
+	return m.sys.remove(filepath.Clean(target))
+}
+
+func hasMountedAncestor(mounted map[string]bool, dstPath string) bool {
+	cleanDst := filepath.Clean(dstPath)
+	for mp, active := range mounted {
+		if !active {
+			continue
+		}
+		cleanMP := filepath.Clean(mp)
+		if cleanMP != cleanDst && strings.HasPrefix(cleanDst, cleanMP+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) runtimeLocked(name string) *jailRuntime {
@@ -177,10 +251,10 @@ func (m *Manager) initWorkspace() error {
 	if err := os.MkdirAll(m.workDir, 0o700); err != nil {
 		return fmt.Errorf("mkdir workDir %s: %w", m.workDir, err)
 	}
-	if err := syscall.Mount("tmpfs", m.workDir, "tmpfs", 0, "mode=0700"); err != nil {
+	if err := m.sys.mount("tmpfs", m.workDir, "tmpfs", 0, "mode=0700"); err != nil {
 		return fmt.Errorf("mount tmpfs on workDir %s: %w", m.workDir, err)
 	}
-	if err := syscall.Mount("", m.workDir, "", syscall.MS_PRIVATE, ""); err != nil {
+	if err := m.sys.mount("", m.workDir, "", syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make-private workDir %s: %w", m.workDir, err)
 	}
 	return nil
@@ -323,7 +397,14 @@ func (m *Manager) DeleteJail(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	rt := m.runtimeLocked(name)
+	if !validJailName(name) {
+		return store.ErrInvalidName
+	}
+
+	rt, ok := m.jails[name]
+	if !ok {
+		return m.store.Delete(name)
+	}
 	switch rt.state {
 	case stateDeleting:
 		return ErrJailBusy
@@ -358,13 +439,13 @@ func (m *Manager) DeleteJail(name string) error {
 	return m.store.Delete(name)
 }
 
-func (m *Manager) Expose(name, rawPath, rawTarget string, ro bool) (model.JailStatus, error) {
+func (m *Manager) Expose(name, rawPath, rawTarget string, rw bool) (model.JailStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	cleanPath := filepath.Clean(rawPath)
-	if !filepath.IsAbs(cleanPath) {
-		return model.JailStatus{}, fmt.Errorf("path must be absolute: %q", rawPath)
+	if !filepath.IsAbs(cleanPath) || cleanPath == "/" {
+		return model.JailStatus{}, fmt.Errorf("path must be an absolute non-root path: %q", rawPath)
 	}
 	if _, err := os.Stat(cleanPath); err != nil {
 		return model.JailStatus{}, fmt.Errorf("source path %q: %w", cleanPath, err)
@@ -373,15 +454,15 @@ func (m *Manager) Expose(name, rawPath, rawTarget string, ro bool) (model.JailSt
 	cleanTarget := cleanPath
 	if strings.TrimSpace(rawTarget) != "" {
 		cleanTarget = filepath.Clean(strings.TrimSpace(rawTarget))
-		if !filepath.IsAbs(cleanTarget) {
-			return model.JailStatus{}, fmt.Errorf("target path must be absolute: %q", rawTarget)
+		if !filepath.IsAbs(cleanTarget) || cleanTarget == "/" {
+			return model.JailStatus{}, fmt.Errorf("target path must be an absolute non-root path: %q", rawTarget)
 		}
 	}
 
 	rt := m.runtimeLocked(name)
 	switch rt.state {
 	case stateStopped, stateAddingPkgStopped:
-		entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadOnly: ro}
+		entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadWrite: rw}
 		cfg, err := m.store.SetMount(name, entry)
 		if err != nil {
 			return model.JailStatus{}, err
@@ -389,13 +470,13 @@ func (m *Manager) Expose(name, rawPath, rawTarget string, ro bool) (model.JailSt
 		return m.statusLocked(cfg), nil
 
 	case stateMounted, stateAddingPkgMounted:
-		entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadOnly: ro}
+		entry := model.MountEntry{Path: cleanPath, Target: cleanTarget, ReadWrite: rw}
 		cfg, err := m.store.SetMount(name, entry)
 		if err != nil {
 			return model.JailStatus{}, err
 		}
 		if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
-			return m.exposePathLocked(ws, entry.Path, entry.Target, ro)
+			return m.exposePathLocked(ws, entry.Path, entry.Target, !rw)
 		}); err != nil {
 			return model.JailStatus{}, err
 		}
@@ -414,8 +495,8 @@ func (m *Manager) Hide(name, rawTarget string) (model.JailStatus, error) {
 	defer m.mu.Unlock()
 
 	cleanTarget := filepath.Clean(rawTarget)
-	if !filepath.IsAbs(cleanTarget) {
-		return model.JailStatus{}, fmt.Errorf("path must be absolute: %q", rawTarget)
+	if !filepath.IsAbs(cleanTarget) || cleanTarget == "/" {
+		return model.JailStatus{}, fmt.Errorf("target path must be an absolute non-root path: %q", rawTarget)
 	}
 
 	rt := m.runtimeLocked(name)
@@ -639,7 +720,6 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 	args := []string{
 		"--clearenv",
 		"--die-with-parent",
-		"--new-session",
 		"--unshare-user",
 		"--unshare-pid",
 		"--unshare-ipc",
@@ -691,7 +771,7 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 		"LOGNAME":         cfg.User,
 		"HOME":            jailHome,
 		"PWD":             jailCwd,
-		"SHELL":           "/bin/sh",
+		"SHELL":           "/bin/bash",
 		"TMPDIR":          "/tmp",
 		"XDG_RUNTIME_DIR": jailRuntime,
 		"TERM":            "xterm-256color",
@@ -749,6 +829,9 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 }
 
 func (m *Manager) ensureStageLocked(cfg model.JailConfig, rt *jailRuntime) (*stageState, error) {
+	if !validJailName(cfg.Name) {
+		return nil, store.ErrInvalidName
+	}
 	if rt.stage != nil {
 		return rt.stage, nil
 	}
@@ -758,11 +841,11 @@ func (m *Manager) ensureStageLocked(cfg model.JailConfig, rt *jailRuntime) (*sta
 		return nil, fmt.Errorf("mkdir stage %s: %w", stageDir, err)
 	}
 
-	if err := syscall.Mount("tmpfs", stageDir, "tmpfs", 0, "mode=0755"); err != nil {
+	if err := m.sys.mount("tmpfs", stageDir, "tmpfs", 0, "mode=0755"); err != nil {
 		return nil, fmt.Errorf("mount stage tmpfs %s: %w", stageDir, err)
 	}
-	if err := syscall.Mount("", stageDir, "", syscall.MS_SHARED, ""); err != nil {
-		_ = syscall.Unmount(stageDir, syscall.MNT_DETACH)
+	if err := m.sys.mount("", stageDir, "", syscall.MS_SHARED, ""); err != nil {
+		_ = m.sys.unmount(stageDir, syscall.MNT_DETACH)
 		return nil, fmt.Errorf("make-shared stage %s: %w", stageDir, err)
 	}
 
@@ -780,7 +863,7 @@ func (m *Manager) ensureStageLocked(cfg model.JailConfig, rt *jailRuntime) (*sta
 		return nil, err
 	}
 
-	if err := remountBind(stageDir, true); err != nil {
+	if err := m.remountBind(stageDir, true); err != nil {
 		_ = m.teardownStageLocked(cfg.Name, rt)
 		return nil, fmt.Errorf("remount stage ro %s: %w", stageDir, err)
 	}
@@ -794,6 +877,9 @@ func (m *Manager) ensureStageLocked(cfg model.JailConfig, rt *jailRuntime) (*sta
 }
 
 func (m *Manager) teardownStageLocked(name string, rt *jailRuntime) error {
+	if !validJailName(name) {
+		return store.ErrInvalidName
+	}
 	st := rt.stage
 	if st == nil {
 		return nil
@@ -803,17 +889,17 @@ func (m *Manager) teardownStageLocked(name string, rt *jailRuntime) error {
 		_ = st.dbusProxy.Wait()
 	}
 	if st.dbusSock != "" {
-		_ = os.Remove(st.dbusSock)
+		_ = m.safeRemoveUnder(m.rootDir, st.dbusSock)
 	}
 	if st.mountState != stageUnmounted {
-		if err := syscall.Unmount(st.stageDir, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
+		if err := m.sys.unmount(st.stageDir, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
 			return fmt.Errorf("unmount stage %s: %w", st.stageDir, err)
 		}
 		st.mountState = stageUnmounted
 		st.rwDepth = 0
 	}
-	_ = os.Remove(st.stageDir)
-	_ = os.Remove(filepath.Join(m.rootDir, name))
+	_ = m.safeRemoveUnder(m.rootDir, st.stageDir)
+	_ = m.safeRemoveUnder(m.rootDir, filepath.Join(m.rootDir, name))
 	rt.stage = nil
 	switch rt.state {
 	case stateMounted:
@@ -832,7 +918,7 @@ func (m *Manager) withWritableStage(st *stageState, fn func(ws writableStage) er
 	case stageUnmounted:
 		return errors.New("cannot write to unmounted stage")
 	case stageMountedRO:
-		if err := remountBind(st.stageDir, false); err != nil {
+		if err := m.remountBind(st.stageDir, false); err != nil {
 			return fmt.Errorf("remount stage rw: %w", err)
 		}
 		st.mountState = stageMountedRW
@@ -846,7 +932,7 @@ func (m *Manager) withWritableStage(st *stageState, fn func(ws writableStage) er
 	defer func() {
 		st.rwDepth--
 		if st.rwDepth == 0 && st.mountState == stageMountedRW {
-			_ = remountBind(st.stageDir, true)
+			_ = m.remountBind(st.stageDir, true)
 			st.mountState = stageMountedRO
 		}
 	}()
@@ -877,10 +963,10 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 		}
 	}
 
-	if err := syscall.Mount("tmpfs", filepath.Join(ws.stageDir, "tmp"), "tmpfs", 0, "mode=1777"); err != nil {
+	if err := m.sys.mount("tmpfs", filepath.Join(ws.stageDir, "tmp"), "tmpfs", 0, "mode=1777"); err != nil {
 		return fmt.Errorf("mount /tmp in stage: %w", err)
 	}
-	if err := syscall.Mount("tmpfs", filepath.Join(ws.stageDir, jailRuntime), "tmpfs", 0, "mode=0700"); err != nil {
+	if err := m.sys.mount("tmpfs", filepath.Join(ws.stageDir, jailRuntime), "tmpfs", 0, "mode=0700"); err != nil {
 		return fmt.Errorf("mount %s in stage: %w", jailRuntime, err)
 	}
 
@@ -892,12 +978,14 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 			return fmt.Errorf("bind home_src: %w", err)
 		}
 	} else {
-		if err := syscall.Mount("tmpfs", filepath.Join(ws.stageDir, cfg.Home), "tmpfs", 0, "mode=0700"); err != nil {
+		if err := m.sys.mount("tmpfs", filepath.Join(ws.stageDir, cfg.Home), "tmpfs", 0, "mode=0700"); err != nil {
 			return fmt.Errorf("mount home tmpfs: %w", err)
 		}
+		bashrcPath := filepath.Join(ws.stageDir, cfg.Home, ".bashrc")
+		_ = os.WriteFile(bashrcPath, []byte("export PS1='[\\u@\\h:\\w]\\$ '\n"), 0o644)
 	}
 
-	passwd := fmt.Sprintf("root:x:0:0:root:/root:/bin/sh\n%s:x:%d:%d::%s:/bin/sh\nnobody:x:65534:65534:Nobody:/:/bin/false\n",
+	passwd := fmt.Sprintf("root:x:0:0:root:/root:/bin/bash\n%s:x:%d:%d::%s:/bin/bash\nnobody:x:65534:65534:Nobody:/:/bin/false\n",
 		cfg.User, m.hostUID, m.hostGID, cfg.Home)
 	group := fmt.Sprintf("root:x:0:\n%s:x:%d:\nnogroup:x:65534:\n", cfg.User, m.hostGID)
 	if err := os.WriteFile(filepath.Join(ws.stageDir, "etc/passwd"), []byte(passwd), 0o444); err != nil {
@@ -910,6 +998,7 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 	shPath := resolveHostBin("bash", "sh")
 	if shPath != "" {
 		_ = os.Symlink(shPath, filepath.Join(ws.stageDir, "bin/sh"))
+		_ = os.Symlink(shPath, filepath.Join(ws.stageDir, "bin/bash"))
 	}
 	envPath := resolveHostBin("env")
 	if envPath != "" {
@@ -1017,7 +1106,7 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 		if _, err := os.Stat(mnt.Path); err != nil {
 			continue
 		}
-		if err := m.exposePathLocked(ws, mnt.Path, mnt.Target, mnt.ReadOnly); err != nil {
+		if err := m.exposePathLocked(ws, mnt.Path, mnt.Target, !mnt.ReadWrite); err != nil {
 			return err
 		}
 	}
@@ -1066,7 +1155,7 @@ func (m *Manager) setupDBusProxyLocked(cfg model.JailConfig, ws writableStage, j
 		return nil
 	}
 	sockPath := filepath.Join(m.rootDir, cfg.Name, "dbus-proxy.sock")
-	_ = os.Remove(sockPath)
+	_ = m.safeRemoveUnder(m.rootDir, sockPath)
 
 	rPipe, wPipe, err := os.Pipe()
 	if err != nil {
@@ -1109,6 +1198,15 @@ func (m *Manager) exposePathLocked(ws writableStage, srcPath, dstPath string, ro
 	if ws.mountState != stageMountedRW {
 		return errors.New("stage must be writable to expose paths")
 	}
+	cleanDst := filepath.Clean(dstPath)
+	if !filepath.IsAbs(cleanDst) || cleanDst == "/" {
+		return fmt.Errorf("invalid target path %q", dstPath)
+	}
+	stageTarget := filepath.Join(ws.stageDir, cleanDst)
+	if err := checkStrictSubpath(ws.stageDir, stageTarget); err != nil {
+		return err
+	}
+
 	resolvedSrc, err := filepath.EvalSymlinks(srcPath)
 	if err != nil {
 		resolvedSrc = srcPath
@@ -1123,11 +1221,15 @@ func (m *Manager) exposePathLocked(ws writableStage, srcPath, dstPath string, ro
 		return fmt.Errorf("mktemp in workDir: %w", err)
 	}
 	workTarget := workParent
+	mountedWork := false
 	defer func() {
-		if workTarget != workParent {
-			_ = os.Remove(workTarget)
+		if mountedWork {
+			_ = m.sys.unmount(workTarget, syscall.MNT_DETACH)
 		}
-		_ = os.Remove(workParent)
+		if workTarget != workParent {
+			_ = m.safeRemoveUnder(m.workDir, workTarget)
+		}
+		_ = m.safeRemoveUnder(m.workDir, workParent)
 	}()
 
 	if !info.IsDir() {
@@ -1137,46 +1239,42 @@ func (m *Manager) exposePathLocked(ws writableStage, srcPath, dstPath string, ro
 		}
 	}
 
-	if err := syscall.Mount(resolvedSrc, workTarget, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+	if err := m.sys.mount(resolvedSrc, workTarget, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
 		return fmt.Errorf("rbind %s to %s: %w", resolvedSrc, workTarget, err)
 	}
+	mountedWork = true
 
 	if ro {
-		if err := remountTreeReadOnly(workTarget); err != nil {
-			_ = syscall.Unmount(workTarget, syscall.MNT_DETACH)
+		if err := m.remountTreeReadOnly(workTarget); err != nil {
 			return fmt.Errorf("remount ro %s: %w", workTarget, err)
 		}
 	}
 
-	stageTarget := filepath.Join(ws.stageDir, dstPath)
-	if ws.mounted[dstPath] {
-		_ = syscall.Unmount(stageTarget, syscall.MNT_DETACH)
+	if ws.mounted[cleanDst] {
+		_ = m.sys.unmount(stageTarget, syscall.MNT_DETACH)
 	}
 
 	if info.IsDir() {
 		if err := os.MkdirAll(stageTarget, 0o755); err != nil {
-			_ = syscall.Unmount(workTarget, syscall.MNT_DETACH)
 			return fmt.Errorf("mkdir target %s: %w", stageTarget, err)
 		}
 	} else {
 		if err := os.MkdirAll(filepath.Dir(stageTarget), 0o755); err != nil {
-			_ = syscall.Unmount(workTarget, syscall.MNT_DETACH)
 			return fmt.Errorf("mkdir parent %s: %w", filepath.Dir(stageTarget), err)
 		}
 		if _, err := os.Lstat(stageTarget); errors.Is(err, os.ErrNotExist) {
 			if err := os.WriteFile(stageTarget, nil, 0o644); err != nil {
-				_ = syscall.Unmount(workTarget, syscall.MNT_DETACH)
 				return fmt.Errorf("touch target %s: %w", stageTarget, err)
 			}
 		}
 	}
 
-	if err := syscall.Mount(workTarget, stageTarget, "", syscall.MS_MOVE, ""); err != nil {
-		_ = syscall.Unmount(workTarget, syscall.MNT_DETACH)
+	if err := m.sys.mount(workTarget, stageTarget, "", syscall.MS_MOVE, ""); err != nil {
 		return fmt.Errorf("mount --move %s -> %s: %w", workTarget, stageTarget, err)
 	}
+	mountedWork = false
 
-	ws.mounted[dstPath] = true
+	ws.mounted[cleanDst] = true
 	return nil
 }
 
@@ -1184,12 +1282,24 @@ func (m *Manager) hidePathLocked(ws writableStage, dstPath string) error {
 	if ws.mountState != stageMountedRW {
 		return errors.New("stage must be writable to hide paths")
 	}
-	stageTarget := filepath.Join(ws.stageDir, dstPath)
-	if err := syscall.Unmount(stageTarget, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
+	cleanDst := filepath.Clean(dstPath)
+	if !filepath.IsAbs(cleanDst) || cleanDst == "/" {
+		return fmt.Errorf("invalid target path %q", dstPath)
+	}
+	if !ws.mounted[cleanDst] {
+		return nil
+	}
+	stageTarget := filepath.Join(ws.stageDir, cleanDst)
+	if err := checkStrictSubpath(ws.stageDir, stageTarget); err != nil {
+		return err
+	}
+	if err := m.sys.unmount(stageTarget, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.ENOENT) {
 		return fmt.Errorf("unmount %s: %w", stageTarget, err)
 	}
-	_ = os.Remove(stageTarget)
-	delete(ws.mounted, dstPath)
+	delete(ws.mounted, cleanDst)
+	if !hasMountedAncestor(ws.mounted, cleanDst) {
+		_ = m.safeRemoveUnder(ws.stageDir, stageTarget)
+	}
 	return nil
 }
 
@@ -1203,25 +1313,25 @@ const preservedMountFlags = uintptr(
 		syscall.MS_SYNCHRONOUS,
 )
 
-func remountBind(mp string, readOnly bool) error {
+func (m *Manager) remountBind(mp string, readOnly bool) error {
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(mp, &st); err != nil {
+	if err := m.sys.statfs(mp, &st); err != nil {
 		return err
 	}
 	flags := (uintptr(st.Flags) & preservedMountFlags) | syscall.MS_BIND | syscall.MS_REMOUNT
 	if readOnly {
 		flags |= syscall.MS_RDONLY
 	}
-	return syscall.Mount("", mp, "", flags, "")
+	return m.sys.mount("", mp, "", flags, "")
 }
 
-func remountTreeReadOnly(root string) error {
+func (m *Manager) remountTreeReadOnly(root string) error {
 	mounts, err := submountsUnder(root)
 	if err != nil || len(mounts) == 0 {
-		return remountBind(root, true)
+		return m.remountBind(root, true)
 	}
 	for _, mp := range mounts {
-		if err := remountBind(mp, true); err != nil {
+		if err := m.remountBind(mp, true); err != nil {
 			return err
 		}
 	}

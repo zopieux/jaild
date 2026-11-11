@@ -299,7 +299,7 @@
                     : escapeHtml(m.path);
                 return `
       <li class="mount-item">
-        <span>${label} <span class="badge ${m.ro ? "ro" : "rw"}">${m.ro ? "ro" : "rw"}</span></span>
+        <span>${label} <span class="badge ${m.rw ? "rw" : "ro"}">${m.rw ? "rw" : "ro"}</span></span>
         <button class="secondary" onclick="hidePath('${escapeJs(c.name)}', '${escapeJs(m.target)}')">Hide</button>
       </li>
     `;
@@ -400,10 +400,10 @@
         e.preventDefault();
         const path = e.target.elements.path.value.trim();
         const target = e.target.elements.target.value.trim();
-        const ro = !e.target.elements.rw.checked;
+        const rw = e.target.elements.rw.checked;
         await api("/api/jails/" + encodeURIComponent(name) + "/expose", {
           method: "POST",
-          body: JSON.stringify({ path, target, ro }),
+          body: JSON.stringify({ path, target, rw }),
         });
         refresh();
       }

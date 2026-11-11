@@ -83,9 +83,9 @@ func (c *Client) StopStage(name string) error {
 	return c.doJSON(http.MethodDelete, "/api/jails/"+url.PathEscape(name)+"/stage", nil, nil)
 }
 
-func (c *Client) Expose(name, path, target string, ro bool) (model.JailStatus, error) {
+func (c *Client) Expose(name, path, target string, rw bool) (model.JailStatus, error) {
 	var out model.JailStatus
-	body := model.MountEntry{Path: path, Target: target, ReadOnly: ro}
+	body := model.MountEntry{Path: path, Target: target, ReadWrite: rw}
 	err := c.doJSON(http.MethodPost, "/api/jails/"+url.PathEscape(name)+"/expose", body, &out)
 	return out, err
 }

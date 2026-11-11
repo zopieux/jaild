@@ -142,8 +142,8 @@ pkgs.testers.runNixOSTest {
                 "' >/tmp/jail-worker.log 2>&1 &"
             ))
 
-            machine.succeed(as_user("jail expose dev /tmp/host-rw"))
-            machine.succeed(as_user("jail expose dev /tmp/host-ro ro"))
+            machine.succeed(as_user("jail expose dev /tmp/host-rw --rw"))
+            machine.succeed(as_user("jail expose dev /tmp/host-ro"))
             machine.wait_until_succeeds(
                 as_user("grep -q updated-by-jail /tmp/host-rw/data"),
                 timeout=timedelta(seconds=10),

@@ -8,9 +8,9 @@ const (
 )
 
 type MountEntry struct {
-	Path     string `json:"path" toml:"path"`
-	Target   string `json:"target" toml:"target"`
-	ReadOnly bool   `json:"ro" toml:"ro"`
+	Path      string `json:"path" toml:"path"`
+	Target    string `json:"target,omitempty" toml:"target,omitempty"`
+	ReadWrite bool   `json:"rw" toml:"rw"`
 }
 
 type JailConfig struct {
@@ -40,6 +40,11 @@ func NormalizeConfig(cfg JailConfig) JailConfig {
 	}
 	if cfg.NixMode == "" {
 		cfg.NixMode = NixModeClosure
+	}
+	for i := range cfg.Mounts {
+		if cfg.Mounts[i].Target == "" {
+			cfg.Mounts[i].Target = cfg.Mounts[i].Path
+		}
 	}
 	return cfg
 }

@@ -166,7 +166,7 @@ func (s *Server) handleExpose(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	st, err := s.mgr.Expose(name, req.Path, req.Target, req.ReadOnly)
+	st, err := s.mgr.Expose(name, req.Path, req.Target, req.ReadWrite)
 	if err != nil {
 		writeErr(w, err)
 		return

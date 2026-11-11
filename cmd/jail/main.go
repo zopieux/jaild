@@ -87,7 +87,7 @@ func usage() {
 Commands:
   new <name> [flags] [-- cmd...]   Create or update a jail and mount its stage
   run <name> [cmd...]              Run a command inside a jail
-  expose <name> <path> [ro|--ro]   Dynamically expose a host path into a jail
+  expose <name> <path> [--rw|--ro] Dynamically expose a host path into a jail (default: ro)
   hide <name> <path>               Dynamically unmount/hide an exposed path
   pkg <name> <pkg...>              Add Nix packages/closures into a jail
   ls                               List jails and their stage status
@@ -100,7 +100,7 @@ Commands:
 
 func cmdNew(cli *client.Client, args []string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: jail new <name> [--network] [--gpu] [--gui] [--nix-mode closure|full] [--home-src DIR] [--pkg PKG...]")
+		return fmt.Errorf("usage: jail new <name> [--user USER] [--network] [--gpu] [--gui] [--nix-mode closure|full] [--home DIR] [--pkg PKG...]")
 	}
 	name := args[0]
 	fs := flag.NewFlagSet("new", flag.ContinueOnError)
@@ -121,9 +121,9 @@ func cmdNew(cli *client.Client, args []string) error {
 	fs.BoolVar(&gpu, "gpu", false, "Enable GPU/CUDA access")
 	fs.BoolVar(&gui, "gui", false, "Enable X11 GUI access")
 	fs.StringVar(&nixMode, "nix-mode", string(model.NixModeClosure), "Nix store mode (closure or full)")
-	fs.StringVar(&homeSrc, "home-src", "", "Host directory bound as jail home (empty = ephemeral tmpfs)")
+	fs.StringVar(&homeSrc, "home", "", "Host directory bound as jail home (empty = ephemeral tmpfs)")
 	fs.StringVar(&hostname, "hostname", "", "Hostname inside jail")
-	fs.StringVar(&user, "user", "", "Username inside jail")
+	fs.StringVar(&user, "user", "", "Username inside jail (default: jail name)")
 	fs.BoolVar(&mountStage, "stage", true, "Mount the jail stage immediately")
 	fs.Var(&pkgs, "pkg", "Nix store path or installable to include in closure (repeatable)")
 	fs.Var(&dbusTalk, "dbus-talk", "D-Bus service name to allow via xdg-dbus-proxy (repeatable)")
@@ -200,7 +200,7 @@ func cmdRun(cli *client.Client, args []string) error {
 		if len(spec.DefaultCmd) > 0 {
 			cmdArgs = spec.DefaultCmd
 		} else {
-			cmdArgs = []string{"/bin/sh"}
+			cmdArgs = []string{"/bin/bash"}
 		}
 	}
 
@@ -252,13 +252,15 @@ func openBwrapArgsFD(args []string) (int, error) {
 }
 
 func cmdExpose(cli *client.Client, args []string) error {
-	var ro bool
+	var rw bool
 	var target string
 	var positional []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--ro" || a == "-ro" || (len(positional) == 2 && a == "ro") {
-			ro = true
+			rw = false
+		} else if a == "--rw" || a == "-rw" || (len(positional) == 2 && a == "rw") {
+			rw = true
 		} else if (a == "--target" || a == "-t") && i+1 < len(args) {
 			i++
 			target = args[i]
@@ -267,7 +269,7 @@ func cmdExpose(cli *client.Client, args []string) error {
 		}
 	}
 	if len(positional) != 2 {
-		return fmt.Errorf("usage: jail expose <name> <path> [--target JAIL_PATH] [ro|--ro]")
+		return fmt.Errorf("usage: jail expose <name> <path> [--target JAIL_PATH] [--rw|--ro]")
 	}
 	absPath, err := filepath.Abs(positional[1])
 	if err != nil {
@@ -279,7 +281,7 @@ func cmdExpose(cli *client.Client, args []string) error {
 			return err
 		}
 	}
-	_, err = cli.Expose(positional[0], absPath, target, ro)
+	_, err = cli.Expose(positional[0], absPath, target, rw)
 	return err
 }
 

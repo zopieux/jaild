@@ -16,7 +16,7 @@
           bubblewrap
           util-linux
           coreutils
-          bash
+          bashInteractive
           nix
           xdg-dbus-proxy
         ]

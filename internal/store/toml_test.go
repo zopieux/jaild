@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"jaild/internal/model"
@@ -29,14 +30,20 @@ func TestTOMLCodecRoundTrip(t *testing.T) {
 			"COMPLEX": `hello "world" # not a comment`,
 		},
 		Mounts: []model.MountEntry{
-			{Path: "/mnt/data", Target: "/mnt/data", ReadOnly: false},
-			{Path: "/mnt/models", Target: "/models", ReadOnly: true},
+			{Path: "/mnt/data", Target: "/mnt/data", ReadWrite: true},
+			{Path: "/mnt/models", Target: "/models", ReadWrite: false},
 		},
 	}
 
 	encoded, err := EncodeTOML(orig)
 	if err != nil {
 		t.Fatalf("EncodeTOML failed: %v", err)
+	}
+	if strings.Contains(encoded, `target = "/mnt/data"`) {
+		t.Fatalf("expected target to be omitted when equal to path, got:\n%s", encoded)
+	}
+	if !strings.Contains(encoded, `target = "/models"`) {
+		t.Fatalf("expected distinct target to be present, got:\n%s", encoded)
 	}
 	decoded, err := DecodeTOML(encoded)
 	if err != nil {
@@ -72,19 +79,19 @@ func TestTOMLStoreCRUD(t *testing.T) {
 		t.Fatalf("expected comfy.toml on disk: %v", err)
 	}
 
-	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", Target: "/mnt/models", ReadOnly: true})
+	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", Target: "/mnt/models", ReadWrite: false})
 	if err != nil {
 		t.Fatalf("SetMount: %v", err)
 	}
-	if len(cfg.Mounts) != 1 || !cfg.Mounts[0].ReadOnly {
+	if len(cfg.Mounts) != 1 || cfg.Mounts[0].ReadWrite {
 		t.Fatalf("unexpected mounts: %#v", cfg.Mounts)
 	}
 
-	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", Target: "/mnt/models", ReadOnly: false})
+	cfg, err = s.SetMount("comfy", model.MountEntry{Path: "/mnt/models", Target: "/mnt/models", ReadWrite: true})
 	if err != nil {
 		t.Fatalf("SetMount update: %v", err)
 	}
-	if len(cfg.Mounts) != 1 || cfg.Mounts[0].ReadOnly {
+	if len(cfg.Mounts) != 1 || !cfg.Mounts[0].ReadWrite {
 		t.Fatalf("expected mount to be updated in-place: %#v", cfg.Mounts)
 	}
 

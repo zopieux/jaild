@@ -188,6 +188,15 @@ func (s *TOMLStore) AddPackages(name string, pkgs []string) (model.JailConfig, e
 }
 
 func EncodeTOML(cfg model.JailConfig) (string, error) {
+	if len(cfg.Mounts) > 0 {
+		mounts := slices.Clone(cfg.Mounts)
+		for i := range mounts {
+			if mounts[i].Target == mounts[i].Path {
+				mounts[i].Target = ""
+			}
+		}
+		cfg.Mounts = mounts
+	}
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(cfg); err != nil {
 		return "", fmt.Errorf("encode toml: %w", err)
@@ -203,6 +212,11 @@ func DecodeTOML(input string) (model.JailConfig, error) {
 	}
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
 		return cfg, fmt.Errorf("unknown configuration key %q", undecoded[0].String())
+	}
+	for i := range cfg.Mounts {
+		if cfg.Mounts[i].Target == "" {
+			cfg.Mounts[i].Target = cfg.Mounts[i].Path
+		}
 	}
 	return cfg, nil
 }
