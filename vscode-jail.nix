@@ -48,6 +48,8 @@ let
     mkdir -p "''${RW_DIRS[@]}"
 
     RO_DIRS=(
+      "$HOME/.gitconfig"
+      "$HOME/.config/git"
       "$HOME/.vscode/extensions"
       "$HOME/.config/Code/CachedData"
       "$HOME/.config/direnv"

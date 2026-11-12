@@ -5,6 +5,17 @@
   webPort ? 7480,
 }:
 
+let
+  hmGitConfig = pkgs.writeText "hm_gitconfig" "[user]\n\tname = Test User\n";
+  hmGitIgnore = pkgs.writeText "hm_gitignore" ".direnv/\n";
+  hmSecret = pkgs.writeText "hm_secret" "top-secret-token\n";
+  hmFiles = pkgs.runCommand "home-manager-files" { } ''
+    mkdir -p $out/.config/git
+    ln -s ${hmGitConfig} $out/.config/git/config
+    ln -s ${hmGitIgnore} $out/.config/git/ignore
+    ln -s ${hmSecret} $out/.secret-token
+  '';
+in
 pkgs.testers.runNixOSTest {
   name = if interactiveWeb then "jaild-web-vm" else "jaild-integration";
 
@@ -70,6 +81,7 @@ pkgs.testers.runNixOSTest {
         cores = 4;
         memorySize = 3072;
         additionalPaths = [
+          hmFiles
           pkgs.hello
           pkgs.ripgrep
           pkgs.tree
@@ -260,7 +272,9 @@ pkgs.testers.runNixOSTest {
             ext_json = ${ builtins.toJSON (pkgs.vscode-utils.toExtensionJson [ pkgs.vscode-extensions.mkhl.direnv ]) }
 
             machine.succeed(as_user(
-                "mkdir -p ~/.vscode/extensions ~/.config/Code/User /tmp/test /home/someuser/dev/proj && "
+                "mkdir -p ~/.vscode/extensions ~/.config/Code/User ~/.config/git /tmp/test /home/someuser/dev/proj && "
+                "ln -sfn ${hmFiles}/.config/git/config ~/.config/git/config && "
+                "ln -sfn ${hmFiles}/.config/git/ignore ~/.config/git/ignore && "
                 "ln -sfn ${pkgs.vscode-extensions.mkhl.direnv}/share/vscode/extensions/mkhl.direnv ~/.vscode/extensions/mkhl.direnv && "
                 f"printf %s {shlex.quote(ext_json)} > ~/.vscode/extensions/extensions.json && "
                 "cat > ~/.config/Code/User/settings.json <<'EOF'\n"
@@ -311,6 +325,9 @@ pkgs.testers.runNixOSTest {
             machine.succeed(as_user("jail run code-h-dev-proj -- head -n1 /etc/ssl/certs/ca-bundle.crt"))
             machine.succeed(as_user("jail run code-h-dev-proj -- head -n1 /etc/ssl/certs/ca-certificates.crt"))
             machine.succeed(as_user("jail run code-h-dev-proj -- head -n1 /etc/pki/tls/certs/ca-bundle.crt"))
+            machine.succeed(as_user("jail run code-h-dev-proj -- cat ~/.config/git/config | grep -q 'Test User'"))
+            machine.succeed(as_user("jail run code-h-dev-proj -- cat ~/.config/git/ignore | grep -q '.direnv/'"))
+            machine.succeed(as_user("jail run code-h-dev-proj -- test ! -e ${hmFiles}/.secret-token"))
             machine.succeed(as_user("jail run code-h-dev-proj -- nix-shell -p curl --run 'curl -fsSIm 4 https://google.com'"))
             machine.succeed(as_user(f"jail run code-h-dev-proj -- {hello_bin}"))
             machine.succeed(as_user(f"jail run code-h-dev-proj -- test ! -e {tree_bin}"))

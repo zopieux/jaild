@@ -487,6 +487,7 @@ func (m *Manager) Expose(name, rawPath, rawTarget string, rw bool) (model.JailSt
 				if roots := collectMountStoreRoots(entry.Path); len(roots) > 0 {
 					_ = m.exposeClosureRootsLocked(context.Background(), ws, roots)
 				}
+				m.exposeStoreSymlinkHopsLocked(ws, entry.Path)
 			}
 			return m.exposePathLocked(ws, entry.Path, entry.Target, !rw)
 		}); err != nil {
@@ -1017,13 +1018,22 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 		"LANG":              "C.UTF-8",
 		"SSL_CERT_FILE":     "/etc/ssl/certs/ca-bundle.crt",
 		"NIX_SSL_CERT_FILE": "/etc/ssl/certs/ca-bundle.crt",
+		"NIX_CONFIG":        "extra-experimental-features = nix-command flakes",
 		"PATH":              strings.Join(pathParts, ":"),
 	}
 	if term, ok := req.HostEnv["TERM"]; ok && term != "" {
 		envMap["TERM"] = term
 	}
+	if colorterm, ok := req.HostEnv["COLORTERM"]; ok && colorterm != "" {
+		envMap["COLORTERM"] = colorterm
+	}
 	if lang, ok := req.HostEnv["LANG"]; ok && lang != "" {
 		envMap["LANG"] = lang
+	}
+	if nixPath, ok := req.HostEnv["NIX_PATH"]; ok && nixPath != "" {
+		envMap["NIX_PATH"] = nixPath
+	} else if nixPath := os.Getenv("NIX_PATH"); nixPath != "" {
+		envMap["NIX_PATH"] = nixPath
 	}
 	if cfg.GUI {
 		if disp, ok := req.HostEnv["DISPLAY"]; ok && disp != "" {
@@ -1304,11 +1314,6 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 		m.exposeIfExistsLocked(ws, p, p, true)
 	}
 
-	if m.hostHome != "" {
-		m.exposeIfExistsLocked(ws, filepath.Join(m.hostHome, ".gitconfig"), filepath.Join(cfg.Home, ".gitconfig"), true)
-		m.exposeIfExistsLocked(ws, filepath.Join(m.hostHome, ".config/git"), filepath.Join(cfg.Home, ".config/git"), true)
-	}
-
 	if cfg.Network {
 		for _, p := range []string{
 			"/etc/resolv.conf",
@@ -1393,10 +1398,6 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 			}
 		}
 		roots = append(roots, collectMountStoreRoots("/etc/nix")...)
-		if m.hostHome != "" {
-			roots = append(roots, collectMountStoreRoots(filepath.Join(m.hostHome, ".gitconfig"))...)
-			roots = append(roots, collectMountStoreRoots(filepath.Join(m.hostHome, ".config/git"))...)
-		}
 		if cfg.Network {
 			for _, p := range []string{"/etc/ssl", "/etc/ssl/certs", "/etc/pki/tls/certs"} {
 				roots = append(roots, collectMountStoreRoots(p)...)
@@ -1426,6 +1427,9 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 		if err := m.exposeClosureRootsLocked(context.Background(), ws, roots); err != nil {
 			return err
 		}
+		for _, mnt := range cfg.Mounts {
+			m.exposeStoreSymlinkHopsLocked(ws, mnt.Path)
+		}
 	}
 
 	for _, mnt := range cfg.Mounts {
@@ -1440,26 +1444,89 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 	return nil
 }
 
-func collectMountStoreRoots(srcPath string) []string {
-	var roots []string
-	if r := StoreRootFromPath(srcPath); r != "" {
-		roots = append(roots, r)
-	}
+func walkMountEntries(srcPath string, maxDepth int, fn func(entryPath string)) {
+	fn(srcPath)
 	resolved, err := filepath.EvalSymlinks(srcPath)
 	if err != nil {
-		return roots
+		return
 	}
-	entries, err := os.ReadDir(resolved)
-	if err != nil {
-		return roots
-	}
-	for _, e := range entries {
-		child := filepath.Join(resolved, e.Name())
-		if r := StoreRootFromPath(child); r != "" {
-			roots = append(roots, r)
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if depth > maxDepth || strings.HasPrefix(dir, "/nix/store/") {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if name == ".git" || name == ".direnv" || name == "node_modules" {
+				continue
+			}
+			child := filepath.Join(dir, name)
+			fn(child)
+			if e.IsDir() {
+				walk(child, depth+1)
+			}
 		}
 	}
+	walk(resolved, 1)
+}
+
+func collectMountStoreRoots(srcPath string) []string {
+	var roots []string
+	walkMountEntries(srcPath, 3, func(p string) {
+		if r := StoreRootFromPath(p); r != "" {
+			roots = append(roots, r)
+		}
+	})
 	return roots
+}
+
+func firstStoreSymlinkHop(p string) (string, string, bool) {
+	fi, err := os.Lstat(p)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return "", "", false
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil || !strings.HasPrefix(resolved, "/nix/store/") {
+		return "", "", false
+	}
+	curr := p
+	for range 8 {
+		target, err := os.Readlink(curr)
+		if err != nil {
+			return "", "", false
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(curr), target)
+		}
+		target = filepath.Clean(target)
+		if strings.HasPrefix(target, "/nix/store/") {
+			if target == resolved {
+				return "", "", false
+			}
+			return target, resolved, true
+		}
+		curr = target
+	}
+	return "", "", false
+}
+
+func (m *Manager) exposeStoreSymlinkHopsLocked(ws writableStage, srcPath string) {
+	walkMountEntries(srcPath, 3, func(p string) {
+		hop, resolved, ok := firstStoreSymlinkHop(p)
+		if !ok {
+			return
+		}
+		rest := strings.TrimPrefix(hop, "/nix/store/")
+		parts := strings.SplitN(rest, "/", 2)
+		if parts[0] == "" || ws.storeMounts["/nix/store/"+parts[0]] {
+			return
+		}
+		_ = m.exposePathLocked(ws, resolved, hop, true)
+	})
 }
 
 func (m *Manager) exposeClosureRootsLocked(ctx context.Context, ws writableStage, roots []string) error {
