@@ -20,9 +20,17 @@ import (
 	"jaild/internal/manager"
 	"jaild/internal/server"
 	"jaild/internal/store"
+	"jaild/internal/stub"
 )
 
 func main() {
+	switch filepath.Base(os.Args[0]) {
+	case "nix-shell":
+		os.Exit(stub.RunNixShell(os.Args[1:]))
+	case "nix":
+		os.Exit(stub.RunNix(os.Args[1:]))
+	}
+
 	if os.Getenv("JAILD_IN_NS") != "1" {
 		if err := reexecInNamespace(); err != nil {
 			log.Fatalf("jaild namespace bootstrap failed: %v", err)

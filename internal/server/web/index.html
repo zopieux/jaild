@@ -241,6 +241,9 @@
           <label class="chk"
             ><input type="checkbox" id="new-gui" /> X11 GUI</label
           >
+          <label class="chk"
+            ><input type="checkbox" id="new-stub" checked /> Nix Stub</label
+          >
           <button type="submit">Create Jail</button>
         </form>
       </section>
@@ -341,6 +344,7 @@
           <label class="chk"><input type="checkbox" ${c.network ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'network', this.checked)"> Network</label>
           <label class="chk"><input type="checkbox" ${c.gpu ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'gpu', this.checked)"> GPU (CUDA)</label>
           <label class="chk"><input type="checkbox" ${c.gui ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'gui', this.checked)"> X11 GUI</label>
+          <label class="chk"><input type="checkbox" ${c.stub ? "checked" : ""} onchange="toggleFlag('${escapeJs(c.name)}', 'stub', this.checked)"> Nix Stub</label>
           <select onchange="toggleFlag('${escapeJs(c.name)}', 'nix_mode', this.value)">
             <option value="closure" ${c.nix_mode === "closure" ? "selected" : ""}>nix: closure</option>
             <option value="full" ${c.nix_mode === "full" ? "selected" : ""}>nix: full</option>
@@ -380,6 +384,7 @@
           network: document.getElementById("new-net").checked,
           gpu: document.getElementById("new-gpu").checked,
           gui: document.getElementById("new-gui").checked,
+          stub: document.getElementById("new-stub").checked,
         };
         await api("/api/jails", { method: "POST", body: JSON.stringify(body) });
         openJails.clear();

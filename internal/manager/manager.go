@@ -3,8 +3,11 @@ package manager
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +50,8 @@ type stageState struct {
 	binPaths    []string
 	dbusProxy   *exec.Cmd
 	dbusSock    string
+	stubLn      net.Listener
+	stubSock    string
 }
 
 type writableStage struct {
@@ -297,6 +302,7 @@ func stageConfigEqual(a, b model.JailConfig) bool {
 		a.Network == b.Network &&
 		a.GPU == b.GPU &&
 		a.GUI == b.GUI &&
+		a.Stub == b.Stub &&
 		a.NixMode == b.NixMode &&
 		slices.Equal(a.DBusTalk, b.DBusTalk) &&
 		slices.Equal(a.Packages, b.Packages) &&
@@ -604,18 +610,12 @@ func (m *Manager) AddPackages(name string, specs []string) (model.JailStatus, er
 	return m.runAddPackages(ctx, name, specs)
 }
 
-func (m *Manager) runAddPackages(ctx context.Context, name string, specs []string) (model.JailStatus, error) {
+func (m *Manager) resolveSpecsWithProgress(ctx context.Context, name string, specs []string) ([]string, error) {
 	m.broadcast(model.Event{
 		Type:    "pkg_progress",
 		Jail:    name,
 		Message: "resolving package closure...",
 	})
-
-	defer func() {
-		m.mu.Lock()
-		m.finishAddPackagesLocked(name)
-		m.mu.Unlock()
-	}()
 
 	onProgress := func(msg string) {
 		m.mu.Lock()
@@ -637,13 +637,27 @@ func (m *Manager) runAddPackages(ctx context.Context, name string, specs []strin
 	for _, spec := range specs {
 		roots, err := ResolveInstallableOrPathWithProgress(ctx, spec, onProgress)
 		if err != nil {
-			return model.JailStatus{}, err
+			return nil, err
 		}
 		for _, r := range roots {
 			if !slices.Contains(resolvedRoots, r) {
 				resolvedRoots = append(resolvedRoots, r)
 			}
 		}
+	}
+	return resolvedRoots, nil
+}
+
+func (m *Manager) runAddPackages(ctx context.Context, name string, specs []string) (model.JailStatus, error) {
+	defer func() {
+		m.mu.Lock()
+		m.finishAddPackagesLocked(name)
+		m.mu.Unlock()
+	}()
+
+	resolvedRoots, err := m.resolveSpecsWithProgress(ctx, name, specs)
+	if err != nil {
+		return model.JailStatus{}, err
 	}
 
 	m.mu.Lock()
@@ -679,6 +693,63 @@ func (m *Manager) runAddPackages(ctx context.Context, name string, specs []strin
 	}
 
 	return m.statusLocked(cfg), nil
+}
+
+func (m *Manager) ProvisionStubPackages(name string, specs []string) (model.StubProvisionResponse, error) {
+	normalized := make([]string, 0, len(specs))
+	for _, s := range specs {
+		attr, err := ParseStubAttr(s)
+		if err != nil {
+			return model.StubProvisionResponse{}, err
+		}
+		normalized = append(normalized, attr)
+	}
+
+	m.mu.Lock()
+	ctx, err := m.beginAddPackagesLocked(name)
+	m.mu.Unlock()
+	if err != nil {
+		return model.StubProvisionResponse{}, err
+	}
+
+	defer func() {
+		m.mu.Lock()
+		m.finishAddPackagesLocked(name)
+		m.mu.Unlock()
+	}()
+
+	resolvedRoots, err := m.resolveSpecsWithProgress(ctx, name, normalized)
+	if err != nil {
+		return model.StubProvisionResponse{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return model.StubProvisionResponse{}, err
+	}
+	rt, ok := m.jails[name]
+	if !ok || !rt.state.isAddingPkg() {
+		return model.StubProvisionResponse{}, context.Canceled
+	}
+	cfg, err := m.store.Get(name)
+	if err != nil {
+		return model.StubProvisionResponse{}, err
+	}
+
+	if rt.state == stateAddingPkgMounted && rt.stage != nil && cfg.NixMode == model.NixModeClosure {
+		if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
+			return m.mountClosurePathsLocked(ctx, ws, resolvedRoots)
+		}); err != nil {
+			return model.StubProvisionResponse{}, err
+		}
+	}
+
+	return model.StubProvisionResponse{
+		BinPaths:   CollectBinPaths(resolvedRoots),
+		StorePaths: resolvedRoots,
+	}, nil
 }
 
 func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec, error) {
@@ -891,6 +962,12 @@ func (m *Manager) teardownStageLocked(name string, rt *jailRuntime) error {
 	if st.dbusSock != "" {
 		_ = m.safeRemoveUnder(m.rootDir, st.dbusSock)
 	}
+	if st.stubLn != nil {
+		_ = st.stubLn.Close()
+	}
+	if st.stubSock != "" {
+		_ = m.safeRemoveUnder(m.rootDir, st.stubSock)
+	}
 	if st.mountState != stageUnmounted {
 		if err := m.sys.unmount(st.stageDir, syscall.MNT_DETACH); err != nil && !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.ENOENT) {
 			return fmt.Errorf("unmount stage %s: %w", st.stageDir, err)
@@ -1052,6 +1129,12 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 		}
 	}
 
+	if cfg.Stub {
+		if err := m.setupStubLocked(cfg, ws, jailRuntime); err != nil {
+			return err
+		}
+	}
+
 	if cfg.NixMode == model.NixModeFull {
 		m.exposeIfExistsLocked(ws, "/nix/store", "/nix/store", true)
 		m.exposeIfExistsLocked(ws, "/nix/var", "/nix/var", true)
@@ -1120,6 +1203,10 @@ func (m *Manager) exposeClosureRootsLocked(ctx context.Context, ws writableStage
 			ws.binPaths = append(ws.binPaths, b)
 		}
 	}
+	return m.mountClosurePathsLocked(ctx, ws, roots)
+}
+
+func (m *Manager) mountClosurePathsLocked(ctx context.Context, ws writableStage, roots []string) error {
 	closure, err := QueryClosure(ctx, roots)
 	if err != nil {
 		return err
@@ -1135,6 +1222,57 @@ func (m *Manager) exposeClosureRootsLocked(ctx context.Context, ws writableStage
 			return fmt.Errorf("expose store path %s: %w", p, err)
 		}
 		ws.storeMounts[p] = true
+	}
+	return nil
+}
+
+func (m *Manager) setupStubLocked(cfg model.JailConfig, ws writableStage, jailRuntime string) error {
+	sockPath := filepath.Join(m.rootDir, cfg.Name, "stub.sock")
+	_ = m.safeRemoveUnder(m.rootDir, sockPath)
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		return fmt.Errorf("listen stub socket %s: %w", sockPath, err)
+	}
+	_ = os.Chmod(sockPath, 0o600)
+	ws.stubLn = ln
+	ws.stubSock = sockPath
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /provision", func(w http.ResponseWriter, r *http.Request) {
+		var req model.StubProvisionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		res, err := m.ProvisionStubPackages(cfg.Name, req.Packages)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(res)
+	})
+	srv := &http.Server{Handler: mux}
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	if err := m.exposePathLocked(ws, sockPath, filepath.Join(jailRuntime, "jaild-stub.sock"), false); err != nil {
+		return err
+	}
+
+	selfExe, err := os.Executable()
+	if err == nil && selfExe != "" {
+		if resolved, err := filepath.EvalSymlinks(selfExe); err == nil {
+			selfExe = resolved
+		}
+		if err := m.exposePathLocked(ws, selfExe, "/bin/nix-shell", true); err != nil {
+			return err
+		}
+		if err := m.exposePathLocked(ws, selfExe, "/bin/nix", true); err != nil {
+			return err
+		}
 	}
 	return nil
 }

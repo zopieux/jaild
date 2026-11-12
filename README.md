@@ -26,6 +26,7 @@ Flags for `jail new <name> [flags] [-- default-cmd...]`:
 - `--network` - share host network
 - `--gpu` - expose `/dev/dri`, `/dev/nvidia*`, and OpenGL/CUDA drivers
 - `--gui` - expose X11 socket and `XAUTHORITY`
+- `--stub` - expose in-jail `nix-shell` / `nix` RPC stub (default: `true`; disable with `--stub=false`)
 - `--nix-mode closure|full` - mount only required store closures (default: `closure`) or all of `/nix/store` (`full`)
 - `--home <dir>` - bind a persistent host directory as `$HOME` (default: ephemeral `tmpfs`)
 - `--pkg <installable|path>` - include Nix packages in the jail (repeatable)

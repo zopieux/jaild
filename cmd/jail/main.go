@@ -100,7 +100,7 @@ Commands:
 
 func cmdNew(cli *client.Client, args []string) error {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: jail new <name> [--user USER] [--network] [--gpu] [--gui] [--nix-mode closure|full] [--home DIR] [--pkg PKG...]")
+		return fmt.Errorf("usage: jail new <name> [--user USER] [--network] [--gpu] [--gui] [--stub] [--nix-mode closure|full] [--home DIR] [--pkg PKG...]")
 	}
 	name := args[0]
 	fs := flag.NewFlagSet("new", flag.ContinueOnError)
@@ -108,6 +108,7 @@ func cmdNew(cli *client.Client, args []string) error {
 		network    bool
 		gpu        bool
 		gui        bool
+		stub       bool
 		nixMode    string
 		homeSrc    string
 		hostname   string
@@ -120,8 +121,9 @@ func cmdNew(cli *client.Client, args []string) error {
 	fs.BoolVar(&network, "network", false, "Enable host network access")
 	fs.BoolVar(&gpu, "gpu", false, "Enable GPU/CUDA access")
 	fs.BoolVar(&gui, "gui", false, "Enable X11 GUI access")
+	fs.BoolVar(&stub, "stub", true, "Expose in-jail nix-shell / nix RPC stub")
 	fs.StringVar(&nixMode, "nix-mode", string(model.NixModeClosure), "Nix store mode (closure or full)")
-	fs.StringVar(&homeSrc, "home", "", "Host directory bound as jail home (empty = ephemeral tmpfs)")
+	fs.StringVar(&homeSrc, "home", "", "Host directory bound as jail home (empty = tmpfs)")
 	fs.StringVar(&hostname, "hostname", "", "Hostname inside jail")
 	fs.StringVar(&user, "user", "", "Username inside jail (default: jail name)")
 	fs.BoolVar(&mountStage, "stage", true, "Mount the jail stage immediately")
@@ -148,6 +150,7 @@ func cmdNew(cli *client.Client, args []string) error {
 		Network:  network,
 		GPU:      gpu,
 		GUI:      gui,
+		Stub:     stub,
 		NixMode:  model.NixMode(nixMode),
 		Packages: pkgs,
 		DBusTalk: dbusTalk,

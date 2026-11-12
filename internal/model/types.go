@@ -22,6 +22,7 @@ type JailConfig struct {
 	Network  bool              `json:"network" toml:"network"`
 	GPU      bool              `json:"gpu" toml:"gpu"`
 	GUI      bool              `json:"gui" toml:"gui"`
+	Stub     bool              `json:"stub" toml:"stub"`
 	DBusTalk []string          `json:"dbus_talk,omitempty" toml:"dbus_talk,omitempty"`
 	NixMode  NixMode           `json:"nix_mode" toml:"nix_mode"`
 	Packages []string          `json:"packages,omitempty" toml:"packages,omitempty"`
@@ -77,4 +78,13 @@ type RunSpec struct {
 	PasswdData string   `json:"passwd_data"`
 	GroupData  string   `json:"group_data"`
 	DefaultCmd []string `json:"default_cmd,omitempty"`
+}
+
+type StubProvisionRequest struct {
+	Packages []string `json:"packages"`
+}
+
+type StubProvisionResponse struct {
+	BinPaths   []string `json:"bin_paths"`
+	StorePaths []string `json:"store_paths"`
 }

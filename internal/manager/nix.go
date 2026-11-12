@@ -31,6 +31,20 @@ func StoreRootFromPath(p string) string {
 	return prefix + parts[0]
 }
 
+func ParseStubAttr(spec string) (string, error) {
+	spec = strings.TrimSpace(spec)
+	spec, _ = strings.CutPrefix(spec, "nixpkgs#")
+	if spec == "" || strings.HasPrefix(spec, "-") || strings.HasPrefix(spec, ".") {
+		return "", fmt.Errorf("invalid stub package %q: only nixpkgs attribute names are allowed", spec)
+	}
+	for _, r := range spec {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' && r != '.' {
+			return "", fmt.Errorf("invalid stub package %q: only nixpkgs attribute names are allowed", spec)
+		}
+	}
+	return "nixpkgs#" + spec, nil
+}
+
 func ResolveInstallableOrPath(spec string) ([]string, error) {
 	return ResolveInstallableOrPathWithProgress(context.Background(), spec, nil)
 }
@@ -56,6 +70,27 @@ func ResolveInstallableOrPathWithProgress(ctx context.Context, spec string, onPr
 	if binPath, err := exec.LookPath(spec); err == nil {
 		if root := StoreRootFromPath(binPath); root != "" {
 			return []string{root}, nil
+		}
+	}
+	attr := ""
+	if !strings.Contains(spec, "#") && !strings.HasPrefix(spec, "/") && !strings.HasPrefix(spec, ".") {
+		attr = spec
+	} else if after, ok := strings.CutPrefix(spec, "nixpkgs#"); ok && after != "" && !strings.Contains(after, "#") {
+		attr = after
+	}
+	if attr != "" {
+		if nixBuildBin, err := exec.LookPath("nix-build"); err == nil {
+			if onProgress != nil {
+				onProgress("resolving " + attr + "...")
+			}
+			cmd := exec.CommandContext(ctx, nixBuildBin, "--no-out-link", "<nixpkgs>", "-A", attr)
+			var stdout bytes.Buffer
+			cmd.Stdout = &stdout
+			if err := cmd.Run(); err == nil {
+				if out := parseLines(stdout.String()); len(out) > 0 {
+					return out, nil
+				}
+			}
 		}
 	}
 	nixBin, err := exec.LookPath("nix")

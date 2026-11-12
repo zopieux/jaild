@@ -227,6 +227,7 @@ func TestManagerDeletedHostFoldersAreStrictlyScoped(t *testing.T) {
 	expectedStageTargets := map[string]bool{
 		filepath.Join(stageDir, "work/project"):    true,
 		filepath.Join(stageDir, "etc/single.conf"): true,
+		filepath.Join(rootDir, "dev", "stub.sock"): true,
 		stageDir:                          true,
 		filepath.Join(rootDir, "dev"):     true,
 		filepath.Join(workDir, "exp-dir"): false,

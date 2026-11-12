@@ -26,6 +26,7 @@ pkgs.testers.runNixOSTest {
         ];
       };
 
+      nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
       nix.registry.nixpkgs.to = {
         type = "path";
         path = pkgs.path;
@@ -184,6 +185,40 @@ pkgs.testers.runNixOSTest {
             assert out == "customuser:/home/customuser", f"unexpected user/home: {out}"
             machine.succeed(as_user("jail run dev -- test ! -e /tmp/host-ro/data"))
             machine.succeed(as_user(f"jail run dev -- test ! -e {hello_bin}"))
+
+        with subtest("in-jail nix-shell stub works with --stub (default) and fails with --stub=false"):
+            rg_bin = "${pkgs.ripgrep}/bin/rg"
+            machine.succeed(as_user(f"jail run dev -- test ! -e {rg_bin}"))
+            out = machine.succeed(as_user("jail run dev -- nix-shell -p ripgrep --run 'rg --version'"))
+            assert "ripgrep" in out, f"unexpected rg output: {out}"
+
+            machine.succeed(as_user("jail new nostub --stub=false"))
+            machine.fail(as_user("jail run nostub -- nix-shell -p hello --run hello"))
+
+        with subtest("nefarious in-jail attempts against stub binary and socket"):
+            machine.succeed(as_user(
+                "mkdir -p /tmp/host-secret && "
+                "echo top-secret > /tmp/host-secret/flag && "
+                "cat > /tmp/host-secret/flake.nix <<'EOF'\n"
+                "{\n"
+                "  outputs = { self }: {\n"
+                "    packages.x86_64-linux.default = builtins.path { path = ./.; name = \"leaked-secret\"; };\n"
+                "  };\n"
+                "}\n"
+                "EOF"
+            ))
+            machine.succeed(as_user("jail run dev -- test ! -e /run/user/1000/jaild.sock"))
+            machine.succeed(as_user(
+                "jail run dev -- nix-shell -p curl --run '"
+                "code=$(curl -s -o /dev/null -w \"%{http_code}\" --unix-socket /run/user/1000/jaild-stub.sock "
+                "-X POST http://localhost/api/jails/dev/expose "
+                "-d \"{\\\"path\\\":\\\"/tmp/host-secret\\\",\\\"target\\\":\\\"/mnt\\\",\\\"rw\\\":true}\"); "
+                "test \"$code\" = 404'"
+            ))
+            machine.succeed(as_user("jail run dev -- test ! -e /mnt/flag"))
+            machine.fail(as_user("jail run dev -- nix-shell -p 'path:/tmp/host-secret#default' --run true"))
+            machine.fail(as_user("jail run dev -- nix-shell -p /tmp/host-secret --run true"))
+            machine.succeed(as_user("jail run dev -- sh -c 'test ! -e /nix/store/*-leaked-secret/flag'"))
 
         with subtest("embedded web UI and REST API over socket"):
             html = machine.succeed(as_user("curl -sf --unix-socket /run/user/1000/jaild.sock http://localhost/"))

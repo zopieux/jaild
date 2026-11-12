@@ -213,6 +213,9 @@ func DecodeTOML(input string) (model.JailConfig, error) {
 	if undecoded := md.Undecoded(); len(undecoded) > 0 {
 		return cfg, fmt.Errorf("unknown configuration key %q", undecoded[0].String())
 	}
+	if !md.IsDefined("stub") {
+		cfg.Stub = true
+	}
 	for i := range cfg.Mounts {
 		if cfg.Mounts[i].Target == "" {
 			cfg.Mounts[i].Target = cfg.Mounts[i].Path

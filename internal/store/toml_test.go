@@ -20,6 +20,7 @@ func TestTOMLCodecRoundTrip(t *testing.T) {
 		Network:  true,
 		GPU:      true,
 		GUI:      false,
+		Stub:     true,
 		NixMode:  model.NixModeClosure,
 		DBusTalk: []string{"org.freedesktop.Notifications"},
 		Packages: []string{"/nix/store/abc-bash", "/nix/store/def-git"},
