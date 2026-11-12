@@ -374,3 +374,33 @@ func TestCreateOrUpdateOverwritesExistingJailAndRemountsStage(t *testing.T) {
 		t.Fatalf("expected remounted stage not to retain old /work/data mount")
 	}
 }
+
+func TestExtractStoreRootsAndResolveJailPath(t *testing.T) {
+	text := `export PATH='/nix/store/aaaa-hello-2.12/bin:/nix/store/bbbb-ripgrep-14.1/bin:/bin'
+declare -x FOO="/nix/store/aaaa-hello-2.12/share/info"`
+	roots := ExtractStoreRoots(text)
+	if len(roots) != 2 || roots[0] != "/nix/store/aaaa-hello-2.12" || roots[1] != "/nix/store/bbbb-ripgrep-14.1" {
+		t.Fatalf("unexpected store roots: %v", roots)
+	}
+
+	m := &Manager{}
+	cfg := model.JailConfig{
+		Home:    "/home/alex",
+		HomeSrc: "/host/home/alex",
+		Mounts: []model.MountEntry{
+			{Path: "/host/projects/demo", Target: "/home/alex/dev/demo", ReadWrite: true},
+			{Path: "/tmp/test", Target: "/tmp/test", ReadWrite: true},
+		},
+	}
+	got1, rw1, err1 := m.resolveJailPathToHostLocked(cfg, "/home/alex/dev/demo/.direnv")
+	if err1 != nil || !rw1 || got1 != "/host/projects/demo/.direnv" {
+		t.Fatalf("expected /host/projects/demo/.direnv (rw=true), got %q (rw=%v, err=%v)", got1, rw1, err1)
+	}
+	got2, rw2, err2 := m.resolveJailPathToHostLocked(cfg, "/home/alex/.cache/direnv")
+	if err2 != nil || !rw2 || got2 != "/host/home/alex/.cache/direnv" {
+		t.Fatalf("expected /host/home/alex/.cache/direnv (rw=true), got %q (rw=%v, err=%v)", got2, rw2, err2)
+	}
+	if _, _, err := m.resolveJailPathToHostLocked(cfg, "/etc/shadow"); err == nil {
+		t.Fatalf("expected /etc/shadow not to resolve to a host path")
+	}
+}

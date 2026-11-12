@@ -160,6 +160,101 @@ func QueryClosure(ctx context.Context, roots []string) ([]string, error) {
 	return paths, nil
 }
 
+func ExtractStoreRoots(texts ...string) []string {
+	var roots []string
+	const prefix = "/nix/store/"
+	for _, t := range texts {
+		s := t
+		for {
+			idx := strings.Index(s, prefix)
+			if idx < 0 {
+				break
+			}
+			s = s[idx:]
+			end := len(prefix)
+			for end < len(s) {
+				c := s[end]
+				if c == '/' || c == ':' || c == '"' || c == '\'' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ';' || c == ')' {
+					break
+				}
+				end++
+			}
+			candidate := s[:end]
+			if end > len(prefix) {
+				if r := StoreRootFromPath(candidate); r != "" && !slices.Contains(roots, r) {
+					roots = append(roots, r)
+				}
+			}
+			s = s[end:]
+		}
+	}
+	return roots
+}
+
+func ResolveFlakeDevEnv(ctx context.Context, hostFlakeDir, attr, hostProfile string, onProgress func(string)) (string, []string, error) {
+	if attr != "" {
+		if _, err := ParseStubAttr(attr); err != nil {
+			return "", nil, err
+		}
+	}
+
+	nixBin, err := exec.LookPath("nix")
+	if err != nil {
+		return "", nil, fmt.Errorf("nix binary not found in PATH: %w", err)
+	}
+	if onProgress != nil {
+		onProgress("evaluating devShell in " + hostFlakeDir + "...")
+	}
+
+	args := []string{
+		"--extra-experimental-features", "nix-command flakes",
+		"--no-warn-dirty",
+		"print-dev-env",
+	}
+	if hostProfile != "" {
+		if err := os.MkdirAll(filepath.Dir(hostProfile), 0o755); err != nil {
+			return "", nil, err
+		}
+		args = append(args, "--profile", hostProfile)
+	}
+	target := hostFlakeDir
+	if attr != "" {
+		target += "#" + attr
+	}
+	args = append(args, target)
+
+	cmd := exec.CommandContext(ctx, nixBin, args...)
+	cmd.Dir = hostFlakeDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", nil, fmt.Errorf("nix print-dev-env %q failed: %v (%s)", target, err, strings.TrimSpace(stderr.String()))
+	}
+
+	var filtered []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "export NIX_BUILD_TOP=") ||
+			strings.HasPrefix(trimmed, "export TMP=") ||
+			strings.HasPrefix(trimmed, "export TMPDIR=") ||
+			strings.HasPrefix(trimmed, "export TEMP=") ||
+			strings.HasPrefix(trimmed, "export TEMPDIR=") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	script := strings.Join(filtered, "\n") + "\nunset NIX_BUILD_TOP TMP TEMP TEMPDIR\nexport TMPDIR=\"/tmp\"\n"
+
+	roots := ExtractStoreRoots(script)
+	if hostProfile != "" {
+		if r := StoreRootFromPath(hostProfile); r != "" && !slices.Contains(roots, r) {
+			roots = append(roots, r)
+		}
+	}
+	return script, roots, nil
+}
+
 func CollectBinPaths(storeRoots []string) []string {
 	var bins []string
 	for _, r := range storeRoots {

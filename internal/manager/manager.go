@@ -81,6 +81,7 @@ type jailRuntime struct {
 	stage       *stageState
 	pkgCancel   context.CancelFunc
 	pkgProgress string
+	pkgDone     chan struct{}
 }
 
 type sysOps struct {
@@ -482,6 +483,11 @@ func (m *Manager) Expose(name, rawPath, rawTarget string, rw bool) (model.JailSt
 			return model.JailStatus{}, err
 		}
 		if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
+			if cfg.NixMode != model.NixModeFull {
+				if roots := collectMountStoreRoots(entry.Path); len(roots) > 0 {
+					_ = m.exposeClosureRootsLocked(context.Background(), ws, roots)
+				}
+			}
 			return m.exposePathLocked(ws, entry.Path, entry.Target, !rw)
 		}); err != nil {
 			return model.JailStatus{}, err
@@ -552,7 +558,28 @@ func (m *Manager) beginAddPackagesLocked(name string) (context.Context, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.pkgCancel = cancel
 	rt.pkgProgress = "resolving package closure..."
+	rt.pkgDone = make(chan struct{})
 	return ctx, nil
+}
+
+func (m *Manager) beginAddPackagesWait(name string) (context.Context, error) {
+	for {
+		m.mu.Lock()
+		ctx, err := m.beginAddPackagesLocked(name)
+		if err == nil {
+			m.mu.Unlock()
+			return ctx, nil
+		}
+		var waitCh chan struct{}
+		if rt, ok := m.jails[name]; ok && errors.Is(err, ErrJailBusy) && rt.state.isAddingPkg() {
+			waitCh = rt.pkgDone
+		}
+		m.mu.Unlock()
+		if waitCh == nil {
+			return nil, err
+		}
+		<-waitCh
+	}
 }
 
 func (m *Manager) finishAddPackagesLocked(name string) {
@@ -563,6 +590,10 @@ func (m *Manager) finishAddPackagesLocked(name string) {
 	if rt.pkgCancel != nil {
 		rt.pkgCancel()
 		rt.pkgCancel = nil
+	}
+	if rt.pkgDone != nil {
+		close(rt.pkgDone)
+		rt.pkgDone = nil
 	}
 	rt.pkgProgress = ""
 	switch rt.state {
@@ -705,9 +736,7 @@ func (m *Manager) ProvisionStubPackages(name string, specs []string) (model.Stub
 		normalized = append(normalized, attr)
 	}
 
-	m.mu.Lock()
-	ctx, err := m.beginAddPackagesLocked(name)
-	m.mu.Unlock()
+	ctx, err := m.beginAddPackagesWait(name)
 	if err != nil {
 		return model.StubProvisionResponse{}, err
 	}
@@ -749,6 +778,145 @@ func (m *Manager) ProvisionStubPackages(name string, specs []string) (model.Stub
 	return model.StubProvisionResponse{
 		BinPaths:   CollectBinPaths(resolvedRoots),
 		StorePaths: resolvedRoots,
+	}, nil
+}
+
+func (m *Manager) resolveJailPathToHostLocked(cfg model.JailConfig, jailPath string) (string, bool, error) {
+	clean := filepath.Clean(jailPath)
+	if !filepath.IsAbs(clean) || clean == "/" {
+		return "", false, fmt.Errorf("invalid jail path %q", jailPath)
+	}
+	mounts := slices.Clone(cfg.Mounts)
+	if cfg.HomeSrc != "" {
+		mounts = append(mounts, model.MountEntry{
+			Path:      cfg.HomeSrc,
+			Target:    cfg.Home,
+			ReadWrite: true,
+		})
+	}
+	var best model.MountEntry
+	found := false
+	for _, mnt := range mounts {
+		if clean == mnt.Target || strings.HasPrefix(clean, mnt.Target+"/") {
+			if !found || len(mnt.Target) > len(best.Target) {
+				best = mnt
+				found = true
+			}
+		}
+	}
+	if !found {
+		return "", false, fmt.Errorf("jail path %q is not inside any exposed mount of jail %s", clean, cfg.Name)
+	}
+	rel := strings.TrimPrefix(clean, best.Target)
+	hostPath := filepath.Clean(filepath.Join(best.Path, rel))
+	if hostPath != best.Path {
+		if err := checkStrictSubpath(best.Path, hostPath); err != nil {
+			return "", false, err
+		}
+	}
+	return hostPath, best.ReadWrite, nil
+}
+
+func (m *Manager) ProvisionDevEnv(name string, req model.StubDevEnvRequest) (model.StubDevEnvResponse, error) {
+	dirPart, attrPart, _ := strings.Cut(strings.TrimSpace(req.Installable), "#")
+	if strings.Contains(dirPart, ":") || strings.HasPrefix(dirPart, "-") {
+		return model.StubDevEnvResponse{}, fmt.Errorf("invalid flake reference %q", req.Installable)
+	}
+	if attrPart != "" {
+		if _, err := ParseStubAttr(attrPart); err != nil {
+			return model.StubDevEnvResponse{}, err
+		}
+	}
+
+	jailFlakeDir := strings.TrimSpace(req.Dir)
+	if dirPart != "" && dirPart != "." {
+		if filepath.IsAbs(dirPart) {
+			jailFlakeDir = dirPart
+		} else {
+			jailFlakeDir = filepath.Join(jailFlakeDir, dirPart)
+		}
+	}
+
+	m.mu.Lock()
+	cfg, err := m.store.Get(name)
+	if err != nil {
+		m.mu.Unlock()
+		return model.StubDevEnvResponse{}, err
+	}
+	hostFlakeDir, _, err := m.resolveJailPathToHostLocked(cfg, jailFlakeDir)
+	if err != nil {
+		m.mu.Unlock()
+		return model.StubDevEnvResponse{}, err
+	}
+	hostProfile := ""
+	if strings.TrimSpace(req.Profile) != "" {
+		var rw bool
+		hostProfile, rw, err = m.resolveJailPathToHostLocked(cfg, req.Profile)
+		if err != nil {
+			m.mu.Unlock()
+			return model.StubDevEnvResponse{}, err
+		}
+		if !rw {
+			m.mu.Unlock()
+			return model.StubDevEnvResponse{}, fmt.Errorf("profile path %q must be inside a read-write mount", req.Profile)
+		}
+	}
+	m.mu.Unlock()
+	ctx, err := m.beginAddPackagesWait(name)
+	if err != nil {
+		return model.StubDevEnvResponse{}, err
+	}
+
+	defer func() {
+		m.mu.Lock()
+		m.finishAddPackagesLocked(name)
+		m.mu.Unlock()
+	}()
+
+	onProgress := func(msg string) {
+		m.mu.Lock()
+		if rt, ok := m.jails[name]; ok && rt.state.isAddingPkg() {
+			rt.pkgProgress = msg
+		}
+		m.mu.Unlock()
+		m.broadcast(model.Event{
+			Type:    "pkg_progress",
+			Jail:    name,
+			Message: msg,
+		})
+	}
+
+	script, roots, err := ResolveFlakeDevEnv(ctx, hostFlakeDir, attrPart, hostProfile, onProgress)
+	if err != nil {
+		return model.StubDevEnvResponse{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return model.StubDevEnvResponse{}, err
+	}
+	rt, ok := m.jails[name]
+	if !ok || !rt.state.isAddingPkg() {
+		return model.StubDevEnvResponse{}, context.Canceled
+	}
+	cfg, err = m.store.Get(name)
+	if err != nil {
+		return model.StubDevEnvResponse{}, err
+	}
+
+	if rt.state == stateAddingPkgMounted && rt.stage != nil && cfg.NixMode == model.NixModeClosure {
+		if err := m.withWritableStage(rt.stage, func(ws writableStage) error {
+			return m.mountClosurePathsLocked(ctx, ws, roots)
+		}); err != nil {
+			return model.StubDevEnvResponse{}, err
+		}
+	}
+
+	return model.StubDevEnvResponse{
+		Script:     script,
+		StorePaths: roots,
 	}, nil
 }
 
@@ -838,17 +1006,18 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 	pathParts := slices.Clone(st.binPaths)
 	pathParts = append(pathParts, "/run/current-system/sw/bin", "/bin", "/usr/bin")
 	envMap := map[string]string{
-		"USER":            cfg.User,
-		"LOGNAME":         cfg.User,
-		"HOME":            jailHome,
-		"PWD":             jailCwd,
-		"SHELL":           "/bin/bash",
-		"TMPDIR":          "/tmp",
-		"XDG_RUNTIME_DIR": jailRuntime,
-		"TERM":            "xterm-256color",
-		"LANG":            "C.UTF-8",
-		"SSL_CERT_FILE":   "/etc/ssl/certs/ca-bundle.crt",
-		"PATH":            strings.Join(pathParts, ":"),
+		"USER":              cfg.User,
+		"LOGNAME":           cfg.User,
+		"HOME":              jailHome,
+		"PWD":               jailCwd,
+		"SHELL":             "/bin/bash",
+		"TMPDIR":            "/tmp",
+		"XDG_RUNTIME_DIR":   jailRuntime,
+		"TERM":              "xterm-256color",
+		"LANG":              "C.UTF-8",
+		"SSL_CERT_FILE":     "/etc/ssl/certs/ca-bundle.crt",
+		"NIX_SSL_CERT_FILE": "/etc/ssl/certs/ca-bundle.crt",
+		"PATH":              strings.Join(pathParts, ":"),
 	}
 	if term, ok := req.HostEnv["TERM"]; ok && term != "" {
 		envMap["TERM"] = term
@@ -870,15 +1039,56 @@ func (m *Manager) BuildRunSpec(name string, req model.RunRequest) (model.RunSpec
 	if st.dbusSock != "" {
 		envMap["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + filepath.Join(jailRuntime, "bus")
 	}
-	for _, k := range cfg.PassEnv {
-		if v, ok := req.HostEnv[k]; ok && v != "" {
-			envMap[k] = v
-		} else if v := os.Getenv(k); v != "" {
-			envMap[k] = v
+	var passedEnvVals []string
+	for _, pattern := range cfg.PassEnv {
+		if prefix, ok := strings.CutSuffix(pattern, "*"); ok {
+			for _, kv := range os.Environ() {
+				if k, v, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, prefix) && v != "" {
+					envMap[k] = v
+					passedEnvVals = append(passedEnvVals, v)
+				}
+			}
+			for k, v := range req.HostEnv {
+				if strings.HasPrefix(k, prefix) && v != "" {
+					envMap[k] = v
+					passedEnvVals = append(passedEnvVals, v)
+				}
+			}
+			continue
+		}
+		if v, ok := req.HostEnv[pattern]; ok && v != "" {
+			envMap[pattern] = v
+			passedEnvVals = append(passedEnvVals, v)
+		} else if v := os.Getenv(pattern); v != "" {
+			envMap[pattern] = v
+			passedEnvVals = append(passedEnvVals, v)
 		}
 	}
 	for k, v := range cfg.Env {
 		envMap[k] = v
+		passedEnvVals = append(passedEnvVals, v)
+	}
+
+	if cfg.NixMode == model.NixModeClosure {
+		roots := ExtractStoreRoots(passedEnvVals...)
+		for _, c := range cfg.Command {
+			if r := StoreRootFromPath(c); r != "" {
+				roots = append(roots, r)
+			}
+		}
+		var missing []string
+		for _, r := range roots {
+			if !st.storeMounts[r] {
+				missing = append(missing, r)
+			}
+		}
+		if len(missing) > 0 {
+			if err := m.withWritableStage(st, func(ws writableStage) error {
+				return m.mountClosurePathsLocked(context.Background(), ws, missing)
+			}); err != nil {
+				return model.RunSpec{}, err
+			}
+		}
 	}
 
 	args = append(args, "--chdir", jailCwd)
@@ -1081,8 +1291,16 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 	if envPath != "" {
 		_ = os.Symlink(envPath, filepath.Join(ws.stageDir, "usr/bin/env"))
 	}
+	direnvPath := resolveHostBin("direnv")
+	if direnvPath != "" {
+		_ = os.Symlink(direnvPath, filepath.Join(ws.stageDir, "bin/direnv"))
+	}
+	gitPath := resolveHostBin("git")
+	if gitPath != "" {
+		_ = os.Symlink(gitPath, filepath.Join(ws.stageDir, "bin/git"))
+	}
 
-	for _, p := range []string{"/etc/os-release", "/etc/localtime", "/etc/nix"} {
+	for _, p := range []string{"/etc/static", "/etc/os-release", "/etc/localtime", "/etc/nix"} {
 		m.exposeIfExistsLocked(ws, p, p, true)
 	}
 
@@ -1150,7 +1368,14 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 		}
 	} else {
 		var roots []string
-		for _, bin := range []string{shPath, envPath, resolveHostBin("ls"), resolveHostBin("cat")} {
+		for _, bin := range []string{
+			shPath,
+			envPath,
+			direnvPath,
+			gitPath,
+			resolveHostBin("ls"),
+			resolveHostBin("cat"),
+		} {
 			if bin != "" {
 				if r := StoreRootFromPath(bin); r != "" {
 					roots = append(roots, r)
@@ -1166,6 +1391,24 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 			if r := StoreRootFromPath(cfg.Command[0]); r != "" {
 				roots = append(roots, r)
 			}
+		}
+		roots = append(roots, collectMountStoreRoots("/etc/nix")...)
+		if m.hostHome != "" {
+			roots = append(roots, collectMountStoreRoots(filepath.Join(m.hostHome, ".gitconfig"))...)
+			roots = append(roots, collectMountStoreRoots(filepath.Join(m.hostHome, ".config/git"))...)
+		}
+		if cfg.Network {
+			for _, p := range []string{"/etc/ssl", "/etc/ssl/certs", "/etc/pki/tls/certs"} {
+				roots = append(roots, collectMountStoreRoots(p)...)
+			}
+		}
+		if cfg.GUI {
+			for _, p := range []string{"/etc/fonts", "/etc/fonts/conf.d"} {
+				roots = append(roots, collectMountStoreRoots(p)...)
+			}
+		}
+		for _, mnt := range cfg.Mounts {
+			roots = append(roots, collectMountStoreRoots(mnt.Path)...)
 		}
 		if cfg.GPU {
 			for _, p := range []string{"/run/opengl-driver", "/run/opengl-driver-32"} {
@@ -1195,6 +1438,28 @@ func (m *Manager) populateStageLocked(cfg model.JailConfig, ws writableStage) er
 	}
 
 	return nil
+}
+
+func collectMountStoreRoots(srcPath string) []string {
+	var roots []string
+	if r := StoreRootFromPath(srcPath); r != "" {
+		roots = append(roots, r)
+	}
+	resolved, err := filepath.EvalSymlinks(srcPath)
+	if err != nil {
+		return roots
+	}
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		return roots
+	}
+	for _, e := range entries {
+		child := filepath.Join(resolved, e.Name())
+		if r := StoreRootFromPath(child); r != "" {
+			roots = append(roots, r)
+		}
+	}
+	return roots
 }
 
 func (m *Manager) exposeClosureRootsLocked(ctx context.Context, ws writableStage, roots []string) error {
@@ -1247,6 +1512,22 @@ func (m *Manager) setupStubLocked(cfg model.JailConfig, ws writableStage, jailRu
 		}
 		res, err := m.ProvisionStubPackages(cfg.Name, req.Packages)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "stub /provision error for %s: %v\n", cfg.Name, err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(res)
+	})
+	mux.HandleFunc("POST /dev-env", func(w http.ResponseWriter, r *http.Request) {
+		var req model.StubDevEnvRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		res, err := m.ProvisionDevEnv(cfg.Name, req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stub /dev-env error for %s: %v\n", cfg.Name, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

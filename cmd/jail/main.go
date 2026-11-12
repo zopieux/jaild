@@ -105,23 +105,28 @@ func cmdNew(cli *client.Client, args []string) error {
 	name := args[0]
 	fs := flag.NewFlagSet("new", flag.ContinueOnError)
 	var (
-		network    bool
-		gpu        bool
-		gui        bool
-		stub       bool
-		nixMode    string
-		homeSrc    string
-		hostname   string
-		user       string
-		mountStage bool
-		pkgs       sliceFlag
-		dbusTalk   sliceFlag
-		passEnv    sliceFlag
+		network     bool
+		gpu         bool
+		gui         bool
+		stub        bool
+		ifNotExists bool
+		nixMode     string
+		homeSrc     string
+		hostname    string
+		user        string
+		mountStage  bool
+		pkgs        sliceFlag
+		dbusTalk    sliceFlag
+		passEnv     sliceFlag
+		roBinds     sliceFlag
+		rwBinds     sliceFlag
+		envVars     sliceFlag
 	)
 	fs.BoolVar(&network, "network", false, "Enable host network access")
 	fs.BoolVar(&gpu, "gpu", false, "Enable GPU/CUDA access")
 	fs.BoolVar(&gui, "gui", false, "Enable X11 GUI access")
 	fs.BoolVar(&stub, "stub", true, "Expose in-jail nix-shell / nix RPC stub")
+	fs.BoolVar(&ifNotExists, "if-not-exists", false, "Keep existing jail configuration if it already exists")
 	fs.StringVar(&nixMode, "nix-mode", string(model.NixModeClosure), "Nix store mode (closure or full)")
 	fs.StringVar(&homeSrc, "home", "", "Host directory bound as jail home (empty = tmpfs)")
 	fs.StringVar(&hostname, "hostname", "", "Hostname inside jail")
@@ -130,6 +135,9 @@ func cmdNew(cli *client.Client, args []string) error {
 	fs.Var(&pkgs, "pkg", "Nix store path or installable to include in closure (repeatable)")
 	fs.Var(&dbusTalk, "dbus-talk", "D-Bus service name to allow via xdg-dbus-proxy (repeatable)")
 	fs.Var(&passEnv, "pass-env", "Host environment variable to forward (repeatable)")
+	fs.Var(&roBinds, "ro-bind", "Read-only host mount path or src:dst (repeatable)")
+	fs.Var(&rwBinds, "rw-bind", "Read-write host mount path or src:dst (repeatable)")
+	fs.Var(&envVars, "env", "Static KEY=VAL environment variable inside jail (repeatable)")
 
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -140,6 +148,57 @@ func cmdNew(cli *client.Client, args []string) error {
 			return err
 		}
 		homeSrc = abs
+	}
+
+	if ifNotExists {
+		if _, err := cli.Get(name); err == nil {
+			if mountStage {
+				_, err = cli.EnsureStage(name)
+			}
+			return err
+		}
+	}
+
+	var mounts []model.MountEntry
+	parseBinds := func(items []string, rw bool) error {
+		for _, item := range items {
+			src, dst, hasDst := strings.Cut(item, ":")
+			absSrc, err := filepath.Abs(src)
+			if err != nil {
+				return err
+			}
+			absDst := absSrc
+			if hasDst && dst != "" {
+				absDst, err = filepath.Abs(dst)
+				if err != nil {
+					return err
+				}
+			}
+			mounts = append(mounts, model.MountEntry{
+				Path:      absSrc,
+				Target:    absDst,
+				ReadWrite: rw,
+			})
+		}
+		return nil
+	}
+	if err := parseBinds(roBinds, false); err != nil {
+		return err
+	}
+	if err := parseBinds(rwBinds, true); err != nil {
+		return err
+	}
+
+	var envMap map[string]string
+	if len(envVars) > 0 {
+		envMap = make(map[string]string, len(envVars))
+		for _, kv := range envVars {
+			k, v, ok := strings.Cut(kv, "=")
+			if !ok || strings.TrimSpace(k) == "" {
+				return fmt.Errorf("invalid --env %q (expected KEY=VAL)", kv)
+			}
+			envMap[k] = v
+		}
 	}
 
 	cfg := model.JailConfig{
@@ -153,8 +212,10 @@ func cmdNew(cli *client.Client, args []string) error {
 		Stub:     stub,
 		NixMode:  model.NixMode(nixMode),
 		Packages: pkgs,
+		Mounts:   mounts,
 		DBusTalk: dbusTalk,
 		PassEnv:  passEnv,
+		Env:      envMap,
 		Command:  fs.Args(),
 	}
 	if _, err := cli.CreateOrUpdate(cfg); err != nil {

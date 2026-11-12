@@ -9,7 +9,10 @@
     { self, nixpkgs }:
     let
       system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      };
       runtimePath = pkgs.lib.makeBinPath (
         with pkgs;
         [
@@ -17,6 +20,8 @@
           util-linux
           coreutils
           bashInteractive
+          direnv
+          gitMinimal
           nix
           xdg-dbus-proxy
         ]
@@ -42,7 +47,7 @@
               let
                 b = baseNameOf path;
               in
-              b != "test" && b != "module.nix" && b != "flake.nix";
+              b != "test" && b != "design" && b != "module.nix" && b != "vscode-jail.nix" && b != "flake.nix";
           };
           vendorHash = "sha256-pbA/AlBz3cQYRTMnQ/qBPcinYOKokrBLNhkbRTq54gE=";
           env.CGO_ENABLED = 0;
@@ -52,6 +57,8 @@
               wrapProgram "$bin" --prefix PATH : "${runtimePath}"
             done
           '';
+          passthru.patchVscode = import ./vscode-jail.nix;
+          meta.mainProgram = "jail";
         };
         default = jaild;
       };

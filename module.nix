@@ -44,7 +44,7 @@ in
         JAILD_DATA_DIR = cfg.dataDir;
       };
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/jaild";
+        ExecStart = lib.getExe' cfg.package "jaild";
       };
     };
   };

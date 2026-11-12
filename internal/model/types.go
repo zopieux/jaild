@@ -88,3 +88,14 @@ type StubProvisionResponse struct {
 	BinPaths   []string `json:"bin_paths"`
 	StorePaths []string `json:"store_paths"`
 }
+
+type StubDevEnvRequest struct {
+	Dir         string `json:"dir"`
+	Profile     string `json:"profile,omitempty"`
+	Installable string `json:"installable,omitempty"`
+}
+
+type StubDevEnvResponse struct {
+	Script     string   `json:"script"`
+	StorePaths []string `json:"store_paths,omitempty"`
+}

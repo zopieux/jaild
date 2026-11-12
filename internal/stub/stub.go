@@ -78,12 +78,15 @@ type nixSubcommand int
 const (
 	nixSubShell nixSubcommand = iota
 	nixSubRun
+	nixSubPrintDevEnv
 )
 
 type nixInvocation struct {
-	Sub      nixSubcommand
-	Packages []string
-	Command  []string
+	Sub         nixSubcommand
+	Packages    []string
+	Command     []string
+	Profile     string
+	Installable string
 }
 
 func ParseNixArgs(args []string) (nixInvocation, error) {
@@ -102,13 +105,38 @@ func ParseNixArgs(args []string) (nixInvocation, error) {
 		break
 	}
 	if idx >= len(args) {
-		return inv, errors.New("usage: nix <shell|run> <installables...> [-c cmd...]")
+		return inv, errors.New("usage: nix <shell|run|print-dev-env> [args...]")
 	}
 
 	sub := args[idx]
 	rest := args[idx+1:]
 
 	switch sub {
+	case "print-dev-env":
+		inv.Sub = nixSubPrintDevEnv
+		for i := 0; i < len(rest); i++ {
+			a := rest[i]
+			if a == "--profile" {
+				if i+1 >= len(rest) {
+					return inv, errors.New("--profile requires a path")
+				}
+				i++
+				inv.Profile = rest[i]
+				continue
+			}
+			if a == "--extra-experimental-features" && i+1 < len(rest) {
+				i++
+				continue
+			}
+			if strings.HasPrefix(a, "-") {
+				continue
+			}
+			if inv.Installable == "" {
+				inv.Installable = a
+			}
+		}
+		return inv, nil
+
 	case "shell":
 		inv.Sub = nixSubShell
 		for i := 0; i < len(rest); i++ {
@@ -153,11 +181,12 @@ func ParseNixArgs(args []string) (nixInvocation, error) {
 		return inv, nil
 
 	default:
-		return inv, fmt.Errorf("nix stub only supports 'nix shell' and 'nix run' (got %q)", sub)
+		return inv, fmt.Errorf("nix stub only supports 'shell', 'run', and 'print-dev-env' (got %q)", sub)
 	}
 }
 
-func Provision(sockPath string, pkgs []string) (model.StubProvisionResponse, error) {
+func postStubJSON[Req any, Resp any](sockPath, endpoint string, req Req) (Resp, error) {
+	var zero Resp
 	if sockPath == "" {
 		sockPath = SocketPath()
 	}
@@ -168,25 +197,41 @@ func Provision(sockPath string, pkgs []string) (model.StubProvisionResponse, err
 		},
 	}
 	cli := &http.Client{Transport: tr}
-	raw, err := json.Marshal(model.StubProvisionRequest{Packages: pkgs})
+	raw, err := json.Marshal(req)
 	if err != nil {
-		return model.StubProvisionResponse{}, err
+		return zero, err
 	}
-	resp, err := cli.Post("http://jaild-stub/provision", "application/json", bytes.NewReader(raw))
+	resp, err := cli.Post("http://jaild-stub"+endpoint, "application/json", bytes.NewReader(raw))
 	if err != nil {
-		return model.StubProvisionResponse{}, fmt.Errorf("connect to jaild stub socket (%s): %w", sockPath, err)
+		return zero, fmt.Errorf("connect to jaild stub socket (%s): %w", sockPath, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(resp.Body)
-		return model.StubProvisionResponse{}, fmt.Errorf("jaild stub error: %s", strings.TrimSpace(string(msg)))
+		return zero, fmt.Errorf("jaild stub error: %s", strings.TrimSpace(string(msg)))
 	}
-	var out model.StubProvisionResponse
+	var out Resp
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return model.StubProvisionResponse{}, err
+		return zero, err
 	}
 	return out, nil
+}
+
+func Provision(sockPath string, pkgs []string) (model.StubProvisionResponse, error) {
+	return postStubJSON[model.StubProvisionRequest, model.StubProvisionResponse](
+		sockPath,
+		"/provision",
+		model.StubProvisionRequest{Packages: pkgs},
+	)
+}
+
+func ProvisionDevEnv(sockPath string, req model.StubDevEnvRequest) (model.StubDevEnvResponse, error) {
+	return postStubJSON[model.StubDevEnvRequest, model.StubDevEnvResponse](
+		sockPath,
+		"/dev-env",
+		req,
+	)
 }
 
 func RunNixShell(args []string) int {
@@ -224,6 +269,30 @@ func RunNix(args []string) int {
 		fmt.Fprintf(os.Stderr, "nix: %v\n", err)
 		return 1
 	}
+
+	if inv.Sub == nixSubPrintDevEnv {
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nix print-dev-env: %v\n", err)
+			return 1
+		}
+		prof := inv.Profile
+		if prof != "" && !filepath.IsAbs(prof) {
+			prof = filepath.Join(cwd, prof)
+		}
+		res, err := ProvisionDevEnv("", model.StubDevEnvRequest{
+			Dir:         cwd,
+			Profile:     prof,
+			Installable: inv.Installable,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "nix print-dev-env: %v\n", err)
+			return 1
+		}
+		fmt.Print(res.Script)
+		return 0
+	}
+
 	res, err := Provision("", inv.Packages)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "nix: %v\n", err)

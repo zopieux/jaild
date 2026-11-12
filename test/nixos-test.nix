@@ -10,6 +10,18 @@ pkgs.testers.runNixOSTest {
 
   nodes.machine =
     { config, lib, pkgs, ... }:
+    let
+      patchedVscode = config.services.jaild.package.patchVscode {
+        inherit lib;
+        inherit (pkgs)
+          coreutils
+          writeShellScriptBin
+          writeText
+          vscode
+          ;
+        jaild = config.services.jaild.package;
+      };
+    in
     {
       imports = [ nixosModule ];
 
@@ -26,6 +38,10 @@ pkgs.testers.runNixOSTest {
         ];
       };
 
+      nix.settings.experimental-features = [
+        "nix-command"
+        "flakes"
+      ];
       nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
       nix.registry.nixpkgs.to = {
         type = "path";
@@ -42,16 +58,28 @@ pkgs.testers.runNixOSTest {
 
       environment.systemPackages = with pkgs; [
         curl
+        direnv
+        gitMinimal
         jq
         iproute2
+        patchedVscode
+        xorg-server
       ];
 
       virtualisation = {
         cores = 4;
-        memorySize = 2048;
+        memorySize = 3072;
         additionalPaths = [
           pkgs.hello
           pkgs.ripgrep
+          pkgs.tree
+          pkgs.vscode-extensions.mkhl.direnv
+          (pkgs.mkShellNoCC {
+            packages = [
+              pkgs.hello
+              pkgs.tree
+            ];
+          }).inputDerivation
         ];
         forwardPorts = lib.optionals interactiveWeb [
           {
@@ -225,5 +253,101 @@ pkgs.testers.runNixOSTest {
             assert "<title>jaild" in html
             jails_json = machine.succeed(as_user("curl -sf --unix-socket /run/user/1000/jaild.sock http://localhost/api/jails | jq -r '.[].config.name'"))
             assert "dev" in jails_json and "web" in jails_json
+
+        with subtest("vscode extension host in jaild closure mode with direnv flake reload"):
+            hello_bin = "${pkgs.hello}/bin/hello"
+            tree_bin = "${pkgs.tree}/bin/tree"
+            ext_json = ${ builtins.toJSON (pkgs.vscode-utils.toExtensionJson [ pkgs.vscode-extensions.mkhl.direnv ]) }
+
+            machine.succeed(as_user(
+                "mkdir -p ~/.vscode/extensions ~/.config/Code/User /tmp/test /home/someuser/dev/proj && "
+                "ln -sfn ${pkgs.vscode-extensions.mkhl.direnv}/share/vscode/extensions/mkhl.direnv ~/.vscode/extensions/mkhl.direnv && "
+                f"printf %s {shlex.quote(ext_json)} > ~/.vscode/extensions/extensions.json && "
+                "cat > ~/.config/Code/User/settings.json <<'EOF'\n"
+                "{\n"
+                "  \"direnv.restart.automatic\": true,\n"
+                "  \"security.workspace.trust.enabled\": false,\n"
+                "  \"window.restoreWindows\": \"none\",\n"
+                "  \"workbench.startupEditor\": \"none\",\n"
+                "  \"extensions.autoUpdate\": false,\n"
+                "  \"update.mode\": \"none\",\n"
+                "  \"telemetry.telemetryLevel\": \"off\"\n"
+                "}\n"
+                "EOF"
+            ))
+
+            machine.succeed(as_user(
+                "cat > /home/someuser/dev/proj/flake.nix <<'EOF'\n"
+                "{\n"
+                "  inputs.nixpkgs.url = \"path:${pkgs.path}\";\n"
+                "  outputs = { self, nixpkgs }: {\n"
+                "    devShells.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.mkShellNoCC {\n"
+                "      packages = [ nixpkgs.legacyPackages.x86_64-linux.hello ];\n"
+                "    };\n"
+                "  };\n"
+                "}\n"
+                "EOF\n"
+                "nix flake lock /home/someuser/dev/proj && "
+                "echo 'use flake' > /home/someuser/dev/proj/.envrc && "
+                "direnv allow /home/someuser/dev/proj"
+            ))
+
+            machine.succeed(as_user("nohup Xvfb :99 -screen 0 1280x1024x24 >/tmp/xvfb.log 2>&1 &"))
+            machine.wait_until_succeeds(as_user("test -S /tmp/.X11-unix/X99"), timeout=timedelta(seconds=10))
+
+            machine.succeed(as_user(
+                "DISPLAY=:99 nohup code --no-sandbox --disable-gpu --verbose /home/someuser/dev/proj >/tmp/vscode.log 2>&1 &"
+            ))
+
+            machine.wait_until_succeeds(
+                as_user(
+                    "jail status code-h-dev-proj | jq -e '.active == true and .config.nix_mode == \"closure\"' && "
+                    "grep -rq 'started (bwrap jail root: /home/someuser/dev/proj)' ~/.config/Code/logs/ && "
+                    "grep -rq '${pkgs.hello}/bin' ~/.config/Code/logs/"
+                ),
+                timeout=timedelta(seconds=60),
+            )
+
+            machine.succeed(as_user("jail run code-h-dev-proj -- head -n1 /etc/ssl/certs/ca-bundle.crt"))
+            machine.succeed(as_user("jail run code-h-dev-proj -- head -n1 /etc/ssl/certs/ca-certificates.crt"))
+            machine.succeed(as_user("jail run code-h-dev-proj -- head -n1 /etc/pki/tls/certs/ca-bundle.crt"))
+            machine.succeed(as_user("jail run code-h-dev-proj -- nix-shell -p curl --run 'curl -fsSIm 4 https://google.com'"))
+            machine.succeed(as_user(f"jail run code-h-dev-proj -- {hello_bin}"))
+            machine.succeed(as_user(f"jail run code-h-dev-proj -- test ! -e {tree_bin}"))
+
+            machine.succeed(as_user(
+                "cat > /home/someuser/dev/proj/flake.nix <<'EOF'\n"
+                "{\n"
+                "  inputs.nixpkgs.url = \"path:${pkgs.path}\";\n"
+                "  outputs = { self, nixpkgs }: {\n"
+                "    devShells.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.mkShellNoCC {\n"
+                "      packages = with nixpkgs.legacyPackages.x86_64-linux; [ hello tree ];\n"
+                "    };\n"
+                "  };\n"
+                "}\n"
+                "EOF"
+            ))
+
+            machine.wait_until_succeeds(
+                as_user(
+                    "grep -rq '${pkgs.tree}/bin' ~/.config/Code/logs/ && "
+                    f"jail run code-h-dev-proj -- {tree_bin} --version"
+                ),
+                timeout=timedelta(seconds=60),
+            )
+
+            machine.succeed(as_user(
+                "cp /home/someuser/dev/proj/flake.nix /home/someuser/dev/proj/flake.lock /home/someuser/dev/proj/.envrc /tmp/test/ && "
+                "direnv allow /tmp/test && "
+                "DISPLAY=:99 nohup code --no-sandbox --disable-gpu --new-window /tmp/test >/tmp/vscode-tmp.log 2>&1 &"
+            ))
+            machine.wait_until_succeeds(
+                as_user(
+                    "jail status code-tmp-test | jq -e '.active == true and .config.nix_mode == \"closure\"' && "
+                    "grep -rq 'started (bwrap jail root: /tmp/test)' ~/.config/Code/logs/ && "
+                    f"jail run code-tmp-test -- {tree_bin} --version"
+                ),
+                timeout=timedelta(seconds=60),
+            )
       '';
 }

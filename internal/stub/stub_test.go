@@ -43,4 +43,16 @@ func TestParseNixArgs(t *testing.T) {
 	if invRun.Sub != nixSubRun || !reflect.DeepEqual(invRun.Packages, []string{"nixpkgs#hello"}) || !reflect.DeepEqual(invRun.Command, []string{"--greeting", "hi"}) {
 		t.Fatalf("unexpected nix run parse: %#v", invRun)
 	}
+
+	invDevEnv, err := ParseNixArgs([]string{
+		"--extra-experimental-features", "nix-command flakes",
+		"print-dev-env",
+		"--profile", "/home/user/proj/.direnv/flake-profile",
+	})
+	if err != nil {
+		t.Fatalf("ParseNixArgs print-dev-env: %v", err)
+	}
+	if invDevEnv.Sub != nixSubPrintDevEnv || invDevEnv.Profile != "/home/user/proj/.direnv/flake-profile" || invDevEnv.Installable != "" {
+		t.Fatalf("unexpected print-dev-env parse: %#v", invDevEnv)
+	}
 }
